@@ -13,7 +13,7 @@ composer require divengine/runner
 ## Quick Start
 
 ```php
-use Divengine\Runner\Runner;
+use divengine\runner\runner;
 
 $context = [
     "name" => "World",
@@ -23,7 +23,7 @@ $flow = function (array &$context): void {
     $context["greeting"] = "Hello " . $context["name"];
 };
 
-Runner::run($flow, $context);
+runner::run($flow, $context);
 
 echo $context["greeting"]; // Hello World
 ```

@@ -1,7 +1,7 @@
 <?php
 declare(strict_types=1);
 
-namespace Divengine\Runner;
+namespace divengine\runner;
 
 use DateTimeImmutable;
 use DateTimeInterface;
@@ -11,7 +11,7 @@ use ReflectionMethod;
 use RuntimeException;
 use Throwable;
 
-final class Runner
+final class runner
 {
     public const DEFAULT_MODULE = "divengine_runner";
     private static $loggerSink = null;

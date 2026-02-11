@@ -23,12 +23,12 @@
   },
   "autoload": {
     "psr-4": {
-      "Divengine\\Runner\\": "src/"
+      "divengine\\runner\\": "src/"
     }
   },
   "autoload-dev": {
     "psr-4": {
-      "Divengine\\Runner\\Tests\\": "tests/"
+      "divengine\\runner\\Tests\\": "tests/"
     }
   },
   "require-dev": {

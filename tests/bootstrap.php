@@ -6,5 +6,5 @@ $autoload = dirname(__DIR__) . '/vendor/autoload.php';
 if (is_file($autoload)) {
     require $autoload;
 } else {
-    require dirname(__DIR__) . '/src/Runner.php';
+    require dirname(__DIR__) . '/src/runner.php';
 }

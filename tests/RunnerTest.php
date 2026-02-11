@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-use Divengine\Runner\Runner;
+use divengine\runner\runner;
 use PHPUnit\Framework\TestCase;
 
 final class RunnerTest extends TestCase
@@ -17,7 +17,7 @@ final class RunnerTest extends TestCase
             $context["ran"] = true;
         };
 
-        Runner::run($flow, $context);
+        runner::run($flow, $context);
 
         $this->assertSame("done", $context["_runner_state"] ?? null);
         $this->assertSame(true, $context["ran"] ?? false);
