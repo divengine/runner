@@ -45,6 +45,6 @@ The runner injects helpers into the context for flow control:
 
 - `_wrap_condition`, `_wrap_activity`, `_wrap_call`, `_wrap_jump`, `_wrap_pause`
 - `_check_pause`, `_update_context`
-- `__flow_loop` for strider-style execution
+- `__flow_loop` for block-style execution
 
 These helpers mirror the logic in the original Python runner.

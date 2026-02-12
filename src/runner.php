@@ -216,9 +216,9 @@ final class runner
     }
 
     /**
-     * Runs strider callables and keeps looping on jump markers.
+     * Runs block callables and keeps looping on jump markers.
      *
-     * @param string $initialStrider Initial strider key (without leading `_`).
+     * @param string $initialBlock Initial block key (without leading `_`).
      * @param array  $context        Shared context by reference.
      *
      * @return mixed
@@ -226,7 +226,7 @@ final class runner
      * @throws RuntimeException
      * @throws Throwable
      */
-    public static function flowLoop(string $initialStrider, array &$context): mixed
+    public static function flowLoop(string $initialBlock, array &$context): mixed
     {
         $tokens = self::ensureTokens($context);
         $jumpToken = $tokens["jump"];
@@ -235,20 +235,20 @@ final class runner
         self::logContext(
             $context,
             "INFO",
-            "[divengine.runner] Starting flow execution with initial strider: {$initialStrider}"
+            "[divengine.runner] Starting flow execution with initial block: {$initialBlock}"
         );
 
         while (true) {
             $state = $context["_flow_state"] ?? [];
-            $savedStrider = $state["strider"] ?? null;
+            $savedBlock = $state["block"] ?? null;
 
-            if ($savedStrider) {
-                $initialStrider = $savedStrider;
+            if ($savedBlock) {
+                $initialBlock = $savedBlock;
             }
 
-            $key = "_" . $initialStrider;
+            $key = "_" . $initialBlock;
             if (!isset($context[$key]) || !is_callable($context[$key])) {
-                throw new RuntimeException("Missing strider callable for {$key}");
+                throw new RuntimeException("Missing block callable for {$key}");
             }
 
             try {
@@ -299,13 +299,13 @@ final class runner
             $flowState["step_index"] = -1;
         }
 
-        if (!array_key_exists("strider", $flowState)) {
-            $flowState["strider"] = null;
+        if (!array_key_exists("block", $flowState)) {
+            $flowState["block"] = null;
         }
 
         $savedIndex = $flowState["step_index"] ?? -1;
 
-        if ($flowState["strider"] === null) {
+        if ($flowState["block"] === null) {
             $context["_flow_state"] = $flowState;
             return true;
         }
@@ -321,7 +321,7 @@ final class runner
         }
 
         if ($stepIdx === $savedIndex + 1) {
-            unset($flowState["step_index"], $flowState["strider"]);
+            unset($flowState["step_index"], $flowState["block"]);
         }
 
         $context["_flow_state"] = $flowState;
@@ -377,7 +377,7 @@ final class runner
         int $targetIndex
     ): void {
         self::traceStep("call", self::callableName($func), $stepId, $stepIdx, $context, $call);
-        $context["_flow_state"] = ["strider" => self::callableName($func), "step_index" => $targetIndex];
+        $context["_flow_state"] = ["block" => self::callableName($func), "step_index" => $targetIndex];
         $func($context);
     }
 
@@ -402,7 +402,7 @@ final class runner
         int $targetIndex
     ): void {
         self::traceStep("jump", self::callableName($func), $stepId, $stepIdx, $context, $jump);
-        $context["_flow_state"] = ["strider" => self::callableName($func), "step_index" => $targetIndex];
+        $context["_flow_state"] = ["block" => self::callableName($func), "step_index" => $targetIndex];
         $tokens = self::ensureTokens($context);
         $token = $tokens["jump"];
         throw new RuntimeException("{$token} Jump to {$jump}");
@@ -411,7 +411,7 @@ final class runner
     /**
      * Persists pause position and throws a pause marker exception.
      *
-     * @param string|null $strider
+     * @param string|null $block
      * @param string|null $stepId
      * @param int|null    $stepIdx
      * @param array       $context
@@ -419,7 +419,7 @@ final class runner
      * @throws RuntimeException
      */
     public static function wrapPause(
-        ?string $strider = null,
+        ?string $block = null,
         ?string $stepId = null,
         ?int $stepIdx = null,
         array &$context = []
@@ -427,21 +427,21 @@ final class runner
         $tokens = self::ensureTokens($context);
         $token = $tokens["pause"];
 
-        $strider = $strider ?? ($context["_flow_state"]["strider"] ?? "unknown");
+        $block = $block ?? ($context["_flow_state"]["block"] ?? "unknown");
         $stepId = $stepId ?? ($context["_current_step_id"] ?? "unknown");
         $stepIdx = $stepIdx ?? ($context["_current_step_index"] ?? -1);
 
-        self::traceStep("pause", $strider, $stepId, $stepIdx, $context);
+        self::traceStep("pause", $block, $stepId, $stepIdx, $context);
 
-        $context["_flow_state"] = ["strider" => $strider, "step_index" => $stepIdx];
+        $context["_flow_state"] = ["block" => $block, "step_index" => $stepIdx];
 
         self::logContext(
             $context,
             "INFO",
-            "[divengine.runner] Pausing execution at {$strider}.{$stepId}[{$stepIdx}]"
+            "[divengine.runner] Pausing execution at {$block}.{$stepId}[{$stepIdx}]"
         );
 
-        throw new RuntimeException("{$token} Pause at {$strider}.{$stepId}[{$stepIdx}]");
+        throw new RuntimeException("{$token} Pause at {$block}.{$stepId}[{$stepIdx}]");
     }
 
     /**
@@ -726,7 +726,7 @@ final class runner
         self::logContext(
             $context,
             "DEBUG",
-            "[divengine.runner] Strider flow {$type} -> {$funcName}.{$stepId} [{$stepIdx}]{$extra}"
+            "[divengine.runner] Block flow {$type} -> {$funcName}.{$stepId} [{$stepIdx}]{$extra}"
         );
     }
 

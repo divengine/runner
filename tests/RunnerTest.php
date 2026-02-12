@@ -161,14 +161,14 @@ final class RunnerTest extends TestCase
         $this->assertTrue((bool) ($context["imported_flow_executed"] ?? false));
     }
 
-    public function testFlowLoopHandlesJumpTokenAndContinuesWithSavedStrider(): void
+    public function testFlowLoopHandlesJumpTokenAndContinuesWithSavedBlock(): void
     {
         $context = [];
         $context["_start"] = function (array &$context): mixed {
             if (!isset($context["jumped"])) {
                 $context["jumped"] = true;
                 $context["_flow_state"] = [
-                    "strider" => "end",
+                    "block" => "end",
                     "step_index" => 1,
                 ];
                 throw new RuntimeException($context["_exception_jump_token"] . " jump");
@@ -202,7 +202,7 @@ final class RunnerTest extends TestCase
     {
         $context = [
             "_flow_state" => [
-                "strider" => "sample",
+                "block" => "sample",
                 "step_index" => 2,
             ],
         ];
@@ -360,14 +360,14 @@ final class RunnerTest extends TestCase
         $context = [];
 
         try {
-            runner::wrapPause("striderX", "pause_step", 12, $context);
+            runner::wrapPause("blockX", "pause_step", 12, $context);
             $this->fail("wrapPause must throw");
         } catch (\RuntimeException $e) {
-            $this->assertStringContainsString("Pause at striderX.pause_step[12]", $e->getMessage());
+            $this->assertStringContainsString("Pause at blockX.pause_step[12]", $e->getMessage());
             $this->assertStringContainsString($context["_exception_pause_token"], $e->getMessage());
         }
 
-        $this->assertSame("striderX", $context["_flow_state"]["strider"] ?? null);
+        $this->assertSame("blockX", $context["_flow_state"]["block"] ?? null);
         $this->assertSame(12, $context["_flow_state"]["step_index"] ?? null);
     }
 
