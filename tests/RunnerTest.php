@@ -92,7 +92,7 @@ final class RunnerTest extends TestCase
     public function testRunRejectsFlowWithoutContextParameterName(): void
     {
         $this->expectException(RuntimeException::class);
-        $this->expectExceptionMessage("must accept 'context' as the only parameter");
+        $this->expectExceptionMessage("first parameter must be named 'context'");
 
         $context = [];
         $flow = function (array &$ctx): void {
@@ -329,6 +329,7 @@ final class RunnerTest extends TestCase
         );
         $this->assertTrue($called);
         $this->assertTrue((bool) ($context["call_ran"] ?? false));
+        $this->assertSame("call_target", $context["_flow_state"]["block"] ?? null);
         $this->assertSame(9, $context["_flow_state"]["step_index"] ?? null);
     }
 
@@ -352,6 +353,7 @@ final class RunnerTest extends TestCase
             $this->assertStringContainsString($context["_exception_jump_token"], $e->getMessage());
         }
 
+        $this->assertSame("go", $context["_flow_state"]["block"] ?? null);
         $this->assertSame(11, $context["_flow_state"]["step_index"] ?? null);
     }
 

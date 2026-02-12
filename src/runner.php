@@ -377,7 +377,12 @@ final class runner
         int $targetIndex
     ): void {
         self::traceStep("call", self::callableName($func), $stepId, $stepIdx, $context, $call);
-        $context["_flow_state"] = ["block" => self::callableName($func), "step_index" => $targetIndex];
+        $targetBlock = trim($call);
+        if ($targetBlock === "") {
+            $targetBlock = self::callableName($func);
+        }
+
+        $context["_flow_state"] = ["block" => $targetBlock, "step_index" => $targetIndex];
         $func($context);
     }
 
@@ -402,7 +407,12 @@ final class runner
         int $targetIndex
     ): void {
         self::traceStep("jump", self::callableName($func), $stepId, $stepIdx, $context, $jump);
-        $context["_flow_state"] = ["block" => self::callableName($func), "step_index" => $targetIndex];
+        $targetBlock = trim($jump);
+        if ($targetBlock === "") {
+            $targetBlock = self::callableName($func);
+        }
+
+        $context["_flow_state"] = ["block" => $targetBlock, "step_index" => $targetIndex];
         $tokens = self::ensureTokens($context);
         $token = $tokens["jump"];
         throw new RuntimeException("{$token} Jump to {$jump}");
@@ -511,7 +521,7 @@ final class runner
             $param = $ref->getParameters()[0];
             if ($param->getName() !== "context") {
                 throw new RuntimeException(
-                    "[divengine.runner] Flow function must accept 'context' as the only parameter."
+                    "[divengine.runner] Flow function first parameter must be named 'context'."
                 );
             }
         }
