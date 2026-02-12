@@ -112,11 +112,13 @@ final class RunnerTest extends TestCase
         );
 
         $callable = runner::importer($filePath);
-        $context = [];
+        $context = [
+            "value" => null,
+        ];
         $callable($context);
 
         $this->assertIsCallable($callable);
-        $this->assertSame(5, $context["value"] ?? null);
+        $this->assertSame(5, $context["value"]);
     }
 
     public function testImporterLoadsFunctionFromPathWithoutPhpExtension(): void
@@ -132,11 +134,13 @@ final class RunnerTest extends TestCase
 
         $pathWithoutExt = substr($filePath, 0, -4);
         $callable = runner::importer($pathWithoutExt);
-        $context = [];
+        $context = [
+            "loaded_from_file" => false,
+        ];
         $callable($context);
 
         $this->assertIsCallable($callable);
-        $this->assertTrue((bool) ($context["loaded_from_file"] ?? false));
+        $this->assertTrue((bool) $context["loaded_from_file"]);
     }
 
     public function testRunLoadsStringFlowUsingImporter(): void

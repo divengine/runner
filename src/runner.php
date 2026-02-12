@@ -238,8 +238,7 @@ final class runner
             "[divengine.runner] Starting flow execution with initial strider: {$initialStrider}"
         );
 
-        $loop = true;
-        while ($loop) {
+        while (true) {
             $state = $context["_flow_state"] ?? [];
             $savedStrider = $state["strider"] ?? null;
 
@@ -253,13 +252,10 @@ final class runner
             }
 
             try {
-                $result = ($context[$key])($context);
-                $loop = false;
-                return $result;
+                return ($context[$key])($context);
             } catch (Throwable $e) {
                 $message = $e->getMessage();
                 if ($jumpToken !== "" && str_contains($message, $jumpToken)) {
-                    $loop = true;
                     continue;
                 }
                 if ($pauseToken !== "" && str_contains($message, $pauseToken)) {
@@ -268,8 +264,6 @@ final class runner
                 throw $e;
             }
         }
-
-        return null;
     }
 
     /**
