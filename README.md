@@ -36,4 +36,14 @@ echo $context["greeting"]; // Hello World
 
 See `docs/README.md` for extended notes on context keys and helpers.
 
+## Performance Benchmarks
+
+Install dev dependencies and run:
+
+```bash
+composer bench
+```
+
+This runs baseline phpbench subjects for callable flow, importer-based flow, and direct flow loop execution.
+
 Powered by [Divengine Software Solutions](https://divengine.com)

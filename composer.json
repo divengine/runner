@@ -32,10 +32,12 @@
     }
   },
   "require-dev": {
+    "phpbench/phpbench": "^1.3",
     "phpstan/phpstan": "^1.10",
     "phpunit/phpunit": "^10.5"
   },
   "scripts": {
+    "bench": "vendor/bin/phpbench run --report=aggregate --progress=none",
     "test": "vendor/bin/phpunit --colors=always",
     "phpstan": "vendor/bin/phpstan analyse -c phpstan.neon --no-progress --memory-limit=1G"
   }
