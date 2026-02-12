@@ -1,6 +1,17 @@
 <?php
 declare(strict_types=1);
 
+/**
+ * divengine runner.
+ *
+ * Lightweight job runner for flow functions that share a mutable context array.
+ * Flow/activity/condition files are imported by path and must return callables.
+ *
+ * @package divengine/runner
+ * @author  Rafa Rodriguez @rafageist
+ * @link    https://github.com/divengine/runner
+ */
+
 namespace divengine\runner;
 
 use DateTimeImmutable;
@@ -13,13 +24,35 @@ use Throwable;
 
 final class runner
 {
+    /**
+     * Optional logger sink set via `setLogger()`.
+     *
+     * Signature: `function(string $level, string $message, array $context = []): void`
+     *
+     * @var callable|null
+     */
     private static $loggerSink = null;
 
+    /**
+     * Sets a global logger callback used when no per-run logger is provided.
+     *
+     * @param callable|null $logger
+     */
     public static function setLogger(?callable $logger): void
     {
         self::$loggerSink = $logger;
     }
 
+    /**
+     * Imports a callable from a PHP file path.
+     *
+     * The target file must `return` a callable. The `.php` extension is optional.
+     *
+     * @param string        $path   Absolute or relative path to the PHP file.
+     * @param callable|null $logger Optional logger callback.
+     *
+     * @return callable|null
+     */
     public static function importer(string $path, ?callable $logger = null): ?callable
     {
         $logger = $logger ?? self::$loggerSink;
@@ -56,6 +89,18 @@ final class runner
         return $func;
     }
 
+    /**
+     * Executes a flow callable (or imports one from path) against a shared context.
+     *
+     * This method mutates `$context` in place and stores execution metadata under
+     * `_runner_*` keys, including logs, timestamps, state and error details.
+     *
+     * @param string|callable $flow    Flow callable or PHP file path.
+     * @param array           $context Shared context passed by reference.
+     * @param array           $options Optional runtime options.
+     *
+     * @throws RuntimeException
+     */
     public static function run(string|callable $flow, array &$context, array $options = []): void
     {
         $loggerSink = $options["logger"] ?? self::$loggerSink;
@@ -83,6 +128,7 @@ final class runner
         $pauseToken = $tokens["pause"];
         $jumpToken = $tokens["jump"];
 
+        // Expose helper callbacks inside context for flow/activity/condition files.
         $context["_logger"] = $logger;
         $context["_importer"] = function (string $path, ?string $unused = null) use (
             $logger
@@ -129,6 +175,7 @@ final class runner
 
         self::validateCallable($func, $requireContextParamName);
 
+        // Pause may request auto-resume, so execution can loop until fully done/error.
         $resume = true;
         while ($resume) {
             $resume = false;
@@ -168,6 +215,17 @@ final class runner
         $context["_runner_ended_at"] = (new DateTimeImmutable())->format(DateTimeInterface::ATOM);
     }
 
+    /**
+     * Runs strider callables and keeps looping on jump markers.
+     *
+     * @param string $initialStrider Initial strider key (without leading `_`).
+     * @param array  $context        Shared context by reference.
+     *
+     * @return mixed
+     *
+     * @throws RuntimeException
+     * @throws Throwable
+     */
     public static function flowLoop(string $initialStrider, array &$context): mixed
     {
         $tokens = self::ensureTokens($context);
@@ -214,12 +272,28 @@ final class runner
         return null;
     }
 
+    /**
+     * Merges step data into the shared context and traces the step.
+     *
+     * @param array  $context Shared context by reference.
+     * @param array  $data    Data to merge.
+     * @param string $stepId  Step identifier.
+     * @param int    $stepIdx Step index.
+     */
     public static function updateContext(array &$context, array $data, string $stepId, int $stepIdx): void
     {
         $context = array_merge($context, $data);
         self::traceStep("context.update", "updateContext", $stepId, $stepIdx, $context);
     }
 
+    /**
+     * Decides if the current step should execute or be skipped after a pause.
+     *
+     * @param int   $stepIdx Current step index.
+     * @param array $context Shared context by reference.
+     *
+     * @return bool
+     */
     public static function checkPause(int $stepIdx, array &$context): bool
     {
         if (!isset($context["_flow_state"])) {
@@ -260,18 +334,46 @@ final class runner
         return true;
     }
 
+    /**
+     * Wraps a condition callable with trace logging.
+     *
+     * @param callable $func
+     * @param string   $stepId
+     * @param int      $stepIdx
+     * @param array    $context
+     *
+     * @return mixed
+     */
     public static function wrapCondition(callable $func, string $stepId, int $stepIdx, array &$context): mixed
     {
         self::traceStep("condition", self::callableName($func), $stepId, $stepIdx, $context);
         return $func($context);
     }
 
+    /**
+     * Wraps an activity callable, stores its result in context and traces the step.
+     *
+     * @param callable $func
+     * @param string   $stepId
+     * @param int      $stepIdx
+     * @param array    $context
+     */
     public static function wrapActivity(callable $func, string $stepId, int $stepIdx, array &$context): void
     {
         self::traceStep("activity", self::callableName($func), $stepId, $stepIdx, $context);
         $context[$stepId] = $func($context);
     }
 
+    /**
+     * Wraps a flow call and updates flow state for continuation handling.
+     *
+     * @param callable $func
+     * @param string   $stepId
+     * @param int      $stepIdx
+     * @param array    $context
+     * @param string   $call
+     * @param int      $targetIndex
+     */
     public static function wrapCall(
         callable $func,
         string $stepId,
@@ -285,6 +387,18 @@ final class runner
         $func($context);
     }
 
+    /**
+     * Wraps a jump operation and throws a jump marker exception.
+     *
+     * @param callable $func
+     * @param string   $stepId
+     * @param int      $stepIdx
+     * @param array    $context
+     * @param string   $jump
+     * @param int      $targetIndex
+     *
+     * @throws RuntimeException
+     */
     public static function wrapJump(
         callable $func,
         string $stepId,
@@ -300,6 +414,16 @@ final class runner
         throw new RuntimeException("{$token} Jump to {$jump}");
     }
 
+    /**
+     * Persists pause position and throws a pause marker exception.
+     *
+     * @param string|null $strider
+     * @param string|null $stepId
+     * @param int|null    $stepIdx
+     * @param array       $context
+     *
+     * @throws RuntimeException
+     */
     public static function wrapPause(
         ?string $strider = null,
         ?string $stepId = null,
@@ -326,6 +450,13 @@ final class runner
         throw new RuntimeException("{$token} Pause at {$strider}.{$stepId}[{$stepIdx}]");
     }
 
+    /**
+     * Safely serializes arrays to JSON, with fallback sanitization.
+     *
+     * @param array $data
+     *
+     * @return string
+     */
     public static function safeSerialize(array $data): string
     {
         $encoded = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
@@ -339,6 +470,13 @@ final class runner
         return $encoded !== false ? $encoded : "{}";
     }
 
+    /**
+     * Converts a throwable chain to a plain-text diagnostic dump.
+     *
+     * @param Throwable $e
+     *
+     * @return string
+     */
     public static function dumpException(Throwable $e): string
     {
         $lines = [];
@@ -357,6 +495,15 @@ final class runner
 
         return implode("\n", $lines);
     }
+
+    /**
+     * Validates flow callable signature requirements.
+     *
+     * @param callable $func
+     * @param bool     $requireContextParamName
+     *
+     * @throws RuntimeException
+     */
     private static function validateCallable(callable $func, bool $requireContextParamName): void
     {
         $ref = self::reflectCallable($func);
@@ -376,6 +523,13 @@ final class runner
         }
     }
 
+    /**
+     * Builds a reflection object for any supported callable shape.
+     *
+     * @param callable $func
+     *
+     * @return ReflectionFunctionAbstract
+     */
     private static function reflectCallable(callable $func): ReflectionFunctionAbstract
     {
         if (is_array($func)) {
@@ -394,6 +548,13 @@ final class runner
         return new ReflectionFunction($func);
     }
 
+    /**
+     * Returns a human-friendly callable identifier for logs/state.
+     *
+     * @param callable $func
+     *
+     * @return string
+     */
     private static function callableName(callable $func): string
     {
         if (is_string($func)) {
@@ -412,6 +573,14 @@ final class runner
         return "callable";
     }
 
+    /**
+     * Creates the effective logger that records in-memory and forwards to sink.
+     *
+     * @param callable|null $sink
+     * @param array         $records
+     *
+     * @return callable
+     */
     private static function makeLogger(?callable $sink, array &$records): callable
     {
         return function (string $level, string $message, array $context = []) use (&$records, $sink): void {
@@ -430,6 +599,14 @@ final class runner
         };
     }
 
+    /**
+     * Emits a prefixed log message either to explicit logger or global sink.
+     *
+     * @param callable|null $logger
+     * @param string        $level
+     * @param string        $message
+     * @param array         $context
+     */
     private static function emitLog(?callable $logger, string $level, string $message, array $context = []): void
     {
         $message = "[divengine.runner] " . $message;
@@ -443,6 +620,14 @@ final class runner
         }
     }
 
+    /**
+     * Sends a log record through the context logger when available.
+     *
+     * @param array  $context
+     * @param string $level
+     * @param string $message
+     * @param array  $logContext
+     */
     private static function logContext(array $context, string $level, string $message, array $logContext = []): void
     {
         $logger = $context["_logger"] ?? null;
@@ -451,6 +636,13 @@ final class runner
         }
     }
 
+    /**
+     * Ensures pause/jump tokens exist in context to classify generic exceptions.
+     *
+     * @param array $context
+     *
+     * @return array{pause:string,jump:string}
+     */
     private static function ensureTokens(array &$context): array
     {
         $pauseKey = "_exception_pause_token";
@@ -470,6 +662,14 @@ final class runner
         ];
     }
 
+    /**
+     * Classifies generic exception by looking for pause/jump tokens in message.
+     *
+     * @param Throwable $e
+     * @param array     $context
+     *
+     * @return string|null
+     */
     private static function classifyException(Throwable $e, array $context): ?string
     {
         $message = $e->getMessage();
@@ -491,6 +691,13 @@ final class runner
         return null;
     }
 
+    /**
+     * Generates a unique token for pause/jump exception markers.
+     *
+     * @param string $prefix
+     *
+     * @return string
+     */
     private static function generateToken(string $prefix): string
     {
         try {
@@ -500,6 +707,16 @@ final class runner
         }
     }
 
+    /**
+     * Tracks the current step and writes a debug trace entry.
+     *
+     * @param string $type
+     * @param string $funcName
+     * @param string $stepId
+     * @param int    $stepIdx
+     * @param array  $context
+     * @param string $info
+     */
     private static function traceStep(
         string $type,
         string $funcName,
@@ -519,6 +736,14 @@ final class runner
         );
     }
 
+    /**
+     * Builds a compact context summary for startup logging.
+     *
+     * @param array $context
+     * @param int   $maxItems
+     *
+     * @return string
+     */
     private static function contextSummary(array $context, int $maxItems = 20): string
     {
         if ($context === []) {
@@ -539,6 +764,13 @@ final class runner
         return implode(", ", $parts);
     }
 
+    /**
+     * Describes a value in one line for context summaries.
+     *
+     * @param mixed $value
+     *
+     * @return string
+     */
     private static function describeValue(mixed $value): string
     {
         if (is_string($value)) {
@@ -569,6 +801,14 @@ final class runner
         return gettype($value);
     }
 
+    /**
+     * Converts non-JSON-safe values into serializable representations.
+     *
+     * @param mixed $value
+     * @param int   $depth
+     *
+     * @return mixed
+     */
     private static function sanitizeForJson(mixed $value, int $depth = 0): mixed
     {
         if ($depth > 8) {
