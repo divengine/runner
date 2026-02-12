@@ -174,6 +174,62 @@ final class RunnerTest extends TestCase
         $this->assertTrue((bool) ($context["imported_flow_executed"] ?? false));
     }
 
+    public function testRunBusinessFixtureFlowUsesActivitiesAndBlocks(): void
+    {
+        $tempDir = $this->createTempProject();
+        $targetFile = $tempDir . DIRECTORY_SEPARATOR . "business-output.txt";
+        $flowPath = __DIR__ . DIRECTORY_SEPARATOR . "flows" . DIRECTORY_SEPARATOR . "business_flow.php";
+
+        $context = [
+            "left" => 8,
+            "right" => 5,
+            "text" => "runner sfm",
+            "customer_name" => "rafa",
+            "enable_audit" => true,
+            "target_file" => $targetFile,
+        ];
+
+        runner::run($flowPath, $context);
+
+        $this->assertSame("done", $context["_runner_state"] ?? null);
+        $this->assertSame(13, $context["sum"] ?? null);
+        $this->assertSame(13, $context["read_value"] ?? null);
+        $this->assertSame("RUNNER SFM", $context["upper_text"] ?? null);
+        $this->assertSame("business_done", $context["flow_result"] ?? null);
+        $this->assertTrue((bool) ($context["file_written"] ?? false));
+        $this->assertIsString($context["now_iso"] ?? null);
+        $this->assertFileExists($targetFile);
+
+        $contents = file_get_contents($targetFile);
+        $this->assertNotFalse($contents);
+        $this->assertStringContainsString("customer=rafa; sum=13; audited=1", (string) $contents);
+    }
+
+    public function testRunPauseResumeFixtureFlowResumesFromSavedStep(): void
+    {
+        $flowPath = __DIR__ . DIRECTORY_SEPARATOR . "flows" . DIRECTORY_SEPARATOR . "pause_resume_flow.php";
+        $context = [
+            "left" => 10,
+            "right" => 2,
+            "text" => "hold me",
+        ];
+
+        runner::run($flowPath, $context);
+
+        $this->assertSame("paused", $context["_runner_state"] ?? null);
+        $this->assertTrue((bool) ($context["pause_once_done"] ?? false));
+        $this->assertSame(12, $context["sum"] ?? null);
+        $this->assertArrayNotHasKey("upper_text", $context);
+
+        runner::run($flowPath, $context);
+
+        $this->assertSame("done", $context["_runner_state"] ?? null);
+        $this->assertSame(12, $context["sum"] ?? null);
+        $this->assertSame("HOLD ME", $context["upper_text"] ?? null);
+        $this->assertSame("resume_done", $context["flow_result"] ?? null);
+        $this->assertSame([], $context["_flow_state"] ?? null);
+    }
+
     public function testFlowLoopHandlesJumpTokenAndContinuesWithSavedBlock(): void
     {
         $context = [];
