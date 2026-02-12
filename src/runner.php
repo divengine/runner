@@ -13,7 +13,6 @@ use Throwable;
 
 final class runner
 {
-    public const DEFAULT_MODULE = "divengine_runner";
     private static $loggerSink = null;
 
     public static function setLogger(?callable $logger): void
@@ -21,55 +20,40 @@ final class runner
         self::$loggerSink = $logger;
     }
 
-    public static function importer(
-        string $name,
-        string $moduleName = self::DEFAULT_MODULE,
-        ?string $basePath = null,
-        ?callable $logger = null
-    ): ?callable {
+    public static function importer(string $path, ?callable $logger = null): ?callable
+    {
         $logger = $logger ?? self::$loggerSink;
-        $basePath = $basePath ?? self::defaultBasePath();
 
-        if (is_callable($name)) {
-            return $name;
+        $resolvedPath = trim($path);
+        if ($resolvedPath === "") {
+            self::emitLog($logger, "ERROR", "Import path is empty.");
+            return null;
         }
 
-        if (function_exists($name)) {
-            return $name;
+        if (!str_ends_with(strtolower($resolvedPath), ".php")) {
+            $resolvedPath .= ".php";
         }
 
-        $paths = self::candidateImportPaths($name, $moduleName, $basePath);
-
-        foreach ($paths as $path) {
-            if (!is_file($path)) {
-                continue;
-            }
-
-            try {
-                require_once $path;
-            } catch (Throwable $e) {
-                self::emitLog($logger, "ERROR", "Error requiring file: " . $path, [
-                    "exception" => self::dumpException($e),
-                ]);
-                return null;
-            }
-
-            if (function_exists($name)) {
-                return $name;
-            }
-
-            $shortName = self::shortName($name);
-            if ($shortName !== $name && function_exists($shortName)) {
-                return $shortName;
-            }
+        if (!is_file($resolvedPath)) {
+            self::emitLog($logger, "ERROR", "Import file not found: {$resolvedPath}");
+            return null;
         }
 
-        if (is_callable($name)) {
-            return $name;
+        try {
+            $func = require $resolvedPath;
+        } catch (Throwable $e) {
+            self::emitLog($logger, "ERROR", "Error requiring file: {$resolvedPath}", [
+                "exception" => self::dumpException($e),
+            ]);
+            return null;
         }
 
-        self::emitLog($logger, "ERROR", "Error importing {$name} from module {$moduleName}");
-        return null;
+        if (!is_callable($func)) {
+            self::emitLog($logger, "ERROR", "Import file must return a callable: {$resolvedPath}");
+            return null;
+        }
+
+        return $func;
     }
 
     public static function run(string|callable $flow, array &$context, array $options = []): void
@@ -78,8 +62,6 @@ final class runner
         if ($loggerSink !== null && !is_callable($loggerSink)) {
             throw new RuntimeException("Logger must be a callable.");
         }
-        $basePath = $options["base_path"] ?? self::defaultBasePath();
-        $moduleName = $options["module"] ?? self::DEFAULT_MODULE;
         $requireContextParamName = $options["require_context_param_name"] ?? true;
 
         $records = [];
@@ -102,12 +84,10 @@ final class runner
         $jumpToken = $tokens["jump"];
 
         $context["_logger"] = $logger;
-        $context["_importer"] = function (string $name, ?string $module = null) use (
-            $basePath,
-            $moduleName,
+        $context["_importer"] = function (string $path, ?string $unused = null) use (
             $logger
         ): ?callable {
-            return self::importer($name, $module ?? $moduleName, $basePath, $logger);
+            return self::importer($path, $logger);
         };
 
         $context["_update_context"] = [self::class, "updateContext"];
@@ -138,12 +118,12 @@ final class runner
 
         $func = $flow;
         if (is_string($flow)) {
-            $func = self::importer($flow, $moduleName, $basePath, $logger);
+            $func = self::importer($flow, $logger);
         }
 
         if (!$func || !is_callable($func)) {
             throw new RuntimeException(
-                "[divengine.runner] Flow function {$moduleName}.{$flowName} must be callable."
+                "[divengine.runner] Flow '{$flowName}' must resolve to a callable."
             );
         }
 
@@ -377,56 +357,6 @@ final class runner
 
         return implode("\n", $lines);
     }
-    private static function defaultBasePath(): string
-    {
-        $envBase = getenv("DIVENGINE_RUNNER_BASE");
-        if (is_string($envBase) && $envBase !== "") {
-            return rtrim($envBase, "/\\");
-        }
-
-        $cwd = getcwd();
-        if (is_string($cwd) && $cwd !== "") {
-            return $cwd;
-        }
-
-        return dirname(__DIR__);
-    }
-
-    private static function candidateImportPaths(string $name, string $moduleName, string $basePath): array
-    {
-        $paths = [];
-
-        $namePath = str_replace("\\", DIRECTORY_SEPARATOR, $name) . ".php";
-
-        $dirs = [
-            $basePath,
-            $basePath . DIRECTORY_SEPARATOR . "functions",
-            $basePath . DIRECTORY_SEPARATOR . "lib" . DIRECTORY_SEPARATOR . "functions",
-            $basePath . DIRECTORY_SEPARATOR . "src" . DIRECTORY_SEPARATOR . "functions",
-            $basePath . DIRECTORY_SEPARATOR . "jobs",
-            $basePath . DIRECTORY_SEPARATOR . "app" . DIRECTORY_SEPARATOR . "functions",
-            $basePath . DIRECTORY_SEPARATOR . "src",
-            $basePath . DIRECTORY_SEPARATOR . "lib",
-        ];
-
-        if ($moduleName !== "") {
-            $dirs[] = $basePath . DIRECTORY_SEPARATOR . $moduleName;
-            $dirs[] = $basePath . DIRECTORY_SEPARATOR . $moduleName . DIRECTORY_SEPARATOR . "functions";
-            $dirs[] = $basePath . DIRECTORY_SEPARATOR . $moduleName . DIRECTORY_SEPARATOR . "lib" . DIRECTORY_SEPARATOR . "functions";
-            $dirs[] = $basePath . DIRECTORY_SEPARATOR . $moduleName . DIRECTORY_SEPARATOR . "src" . DIRECTORY_SEPARATOR . "functions";
-            $dirs[] = $basePath . DIRECTORY_SEPARATOR . $moduleName . DIRECTORY_SEPARATOR . "jobs";
-            $dirs[] = $basePath . DIRECTORY_SEPARATOR . $moduleName . DIRECTORY_SEPARATOR . "src";
-            $dirs[] = $basePath . DIRECTORY_SEPARATOR . $moduleName . DIRECTORY_SEPARATOR . "lib";
-        }
-
-        foreach ($dirs as $dir) {
-            $paths[] = rtrim($dir, "/\\") . DIRECTORY_SEPARATOR . $name . ".php";
-            $paths[] = rtrim($dir, "/\\") . DIRECTORY_SEPARATOR . $namePath;
-        }
-
-        return array_values(array_unique($paths));
-    }
-
     private static function validateCallable(callable $func, bool $requireContextParamName): void
     {
         $ref = self::reflectCallable($func);
@@ -480,15 +410,6 @@ final class runner
         }
 
         return "callable";
-    }
-
-    private static function shortName(string $name): string
-    {
-        $pos = strrpos($name, "\\");
-        if ($pos === false) {
-            return $name;
-        }
-        return substr($name, $pos + 1);
     }
 
     private static function makeLogger(?callable $sink, array &$records): callable

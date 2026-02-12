@@ -10,8 +10,7 @@ use divengine\runner\runner;
  */
 final class runnerBench
 {
-    private static ?string $fixtureBasePath = null;
-    private static ?string $fixtureFlowName = null;
+    private static ?string $fixtureFlowPath = null;
 
     public function benchRunCallable(): void
     {
@@ -31,14 +30,7 @@ final class runnerBench
         $this->ensureStringFlowFixture();
 
         $context = [];
-        runner::run(
-            self::$fixtureFlowName,
-            $context,
-            [
-                "base_path" => self::$fixtureBasePath,
-                "module" => "bench_module",
-            ]
-        );
+        runner::run(self::$fixtureFlowPath, $context);
     }
 
     public function benchFlowLoopDirect(): void
@@ -53,29 +45,25 @@ final class runnerBench
 
     private function ensureStringFlowFixture(): void
     {
-        if (self::$fixtureBasePath !== null && self::$fixtureFlowName !== null) {
+        if (self::$fixtureFlowPath !== null) {
             return;
         }
 
-        $basePath = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR)
+        $fixturesPath = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR)
             . DIRECTORY_SEPARATOR
             . "runner-bench-fixture";
-        $functionsDir = $basePath . DIRECTORY_SEPARATOR . "functions";
-        if (!is_dir($functionsDir)) {
-            mkdir($functionsDir, 0777, true);
+        if (!is_dir($fixturesPath)) {
+            mkdir($fixturesPath, 0777, true);
         }
 
-        $flowName = "bench_flow";
-        $flowPath = $functionsDir . DIRECTORY_SEPARATOR . $flowName . ".php";
+        $flowPath = $fixturesPath . DIRECTORY_SEPARATOR . "bench_flow.php";
 
         $code = "<?php\n";
-        $code .= "function {$flowName}(array &\$context): void\n";
-        $code .= "{\n";
+        $code .= "return function (array &\$context): void {\n";
         $code .= "    \$context['bench'] = true;\n";
-        $code .= "}\n";
+        $code .= "};\n";
         file_put_contents($flowPath, $code);
 
-        self::$fixtureBasePath = $basePath;
-        self::$fixtureFlowName = $flowName;
+        self::$fixtureFlowPath = $flowPath;
     }
 }

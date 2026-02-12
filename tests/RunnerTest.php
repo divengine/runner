@@ -102,26 +102,36 @@ final class RunnerTest extends TestCase
         runner::run($flow, $context);
     }
 
-    public function testImporterReturnsExistingCallable(): void
+    public function testImporterLoadsCallableFromExplicitPath(): void
     {
-        $callable = runner::importer("strlen");
+        $projectDir = $this->createTempProject();
+        $filePath = $this->writeFunctionFile(
+            $projectDir,
+            "flow_load_path",
+            '$context["value"] = 5;'
+        );
+
+        $callable = runner::importer($filePath);
+        $context = [];
+        $callable($context);
 
         $this->assertIsCallable($callable);
-        $this->assertSame(5, $callable("abcde"));
+        $this->assertSame(5, $context["value"] ?? null);
     }
 
-    public function testImporterLoadsFunctionFromProjectFunctionsFolder(): void
+    public function testImporterLoadsFunctionFromPathWithoutPhpExtension(): void
     {
         $projectDir = $this->createTempProject();
         $functionName = "job_" . bin2hex(random_bytes(6));
 
-        $this->writeFunctionFile(
+        $filePath = $this->writeFunctionFile(
             $projectDir,
             $functionName,
             '$context["loaded_from_file"] = true;'
         );
 
-        $callable = runner::importer($functionName, "unused_module", $projectDir);
+        $pathWithoutExt = substr($filePath, 0, -4);
+        $callable = runner::importer($pathWithoutExt);
         $context = [];
         $callable($context);
 
@@ -134,17 +144,14 @@ final class RunnerTest extends TestCase
         $projectDir = $this->createTempProject();
         $functionName = "flow_" . bin2hex(random_bytes(6));
 
-        $this->writeFunctionFile(
+        $filePath = $this->writeFunctionFile(
             $projectDir,
             $functionName,
             '$context["imported_flow_executed"] = true;'
         );
 
         $context = [];
-        runner::run($functionName, $context, [
-            "base_path" => $projectDir,
-            "module" => "unused_module",
-        ]);
+        runner::run($filePath, $context);
 
         $this->assertSame("done", $context["_runner_state"] ?? null);
         $this->assertTrue((bool) ($context["imported_flow_executed"] ?? false));
@@ -225,9 +232,7 @@ final class RunnerTest extends TestCase
         $logs = [];
 
         $callable = runner::importer(
-            "missing_fn_" . bin2hex(random_bytes(4)),
-            "missing_module",
-            $projectDir,
+            $projectDir . DIRECTORY_SEPARATOR . "missing_fn_" . bin2hex(random_bytes(4)),
             function (string $level, string $message) use (&$logs): void {
                 $logs[] = [$level, $message];
             }
@@ -236,7 +241,7 @@ final class RunnerTest extends TestCase
         $this->assertNull($callable);
         $this->assertNotEmpty($logs);
         $this->assertSame("ERROR", $logs[0][0]);
-        $this->assertStringContainsString("Error importing", $logs[0][1]);
+        $this->assertStringContainsString("Import file not found", $logs[0][1]);
     }
 
     public function testImporterHandlesRequireErrorAndLogsException(): void
@@ -248,9 +253,7 @@ final class RunnerTest extends TestCase
 
         $logs = [];
         $callable = runner::importer(
-            $functionName,
-            "unused_module",
-            $projectDir,
+            $brokenPath,
             function (string $level, string $message, array $context = []) use (&$logs): void {
                 $logs[] = [$level, $message, $context];
             }
@@ -263,28 +266,24 @@ final class RunnerTest extends TestCase
         $this->assertArrayHasKey("exception", $logs[0][2]);
     }
 
-    public function testImporterUsesShortNameFallbackForNamespacedRequest(): void
+    public function testImporterFailsWhenFileDoesNotReturnCallable(): void
     {
         $projectDir = $this->createTempProject();
-        $namespacedRequest = "a\\b\\flow_" . bin2hex(random_bytes(4));
-        $shortName = basename(str_replace("\\", "/", $namespacedRequest));
+        $filePath = $projectDir . DIRECTORY_SEPARATOR . "not_callable.php";
+        file_put_contents($filePath, "<?php return 123;");
 
-        $nestedPath = $projectDir . DIRECTORY_SEPARATOR . "functions" . DIRECTORY_SEPARATOR . "a" . DIRECTORY_SEPARATOR . "b";
-        mkdir($nestedPath, 0777, true);
+        $logs = [];
+        $callable = runner::importer(
+            $filePath,
+            function (string $level, string $message) use (&$logs): void {
+                $logs[] = [$level, $message];
+            }
+        );
 
-        $content = "<?php\n";
-        $content .= "function {$shortName}(array &\$context): void\n";
-        $content .= "{\n";
-        $content .= "    \$context['short_name_loaded'] = true;\n";
-        $content .= "}\n";
-        file_put_contents($nestedPath . DIRECTORY_SEPARATOR . $shortName . ".php", $content);
-
-        $callable = runner::importer($namespacedRequest, "unused_module", $projectDir);
-        $context = [];
-        $callable($context);
-
-        $this->assertSame($shortName, $callable);
-        $this->assertTrue((bool) ($context["short_name_loaded"] ?? false));
+        $this->assertNull($callable);
+        $this->assertNotEmpty($logs);
+        $this->assertSame("ERROR", $logs[0][0]);
+        $this->assertStringContainsString("must return a callable", $logs[0][1]);
     }
 
     public function testWrappersAndUpdateContextMutateSharedContext(): void
@@ -410,18 +409,16 @@ final class RunnerTest extends TestCase
         return $tempDir;
     }
 
-    private function writeFunctionFile(string $projectDir, string $functionName, string $bodyLine): void
+    private function writeFunctionFile(string $projectDir, string $functionName, string $bodyLine): string
     {
+        $path = $projectDir . DIRECTORY_SEPARATOR . "functions" . DIRECTORY_SEPARATOR . $functionName . ".php";
         $content = "<?php\n";
-        $content .= "function {$functionName}(array &\$context): void\n";
-        $content .= "{\n";
+        $content .= "return function (array &\$context): void {\n";
         $content .= "    {$bodyLine}\n";
-        $content .= "}\n";
+        $content .= "};\n";
 
-        file_put_contents(
-            $projectDir . DIRECTORY_SEPARATOR . "functions" . DIRECTORY_SEPARATOR . $functionName . ".php",
-            $content
-        );
+        file_put_contents($path, $content);
+        return $path;
     }
 
     private function deleteDirectory(string $path): void
