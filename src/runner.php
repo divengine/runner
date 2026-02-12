@@ -434,6 +434,12 @@ final class runner
         ?int $stepIdx = null,
         array &$context = []
     ): void {
+        if (func_num_args() < 4) {
+            throw new RuntimeException(
+                "[divengine.runner] wrapPause requires shared context as the fourth argument."
+            );
+        }
+
         $tokens = self::ensureTokens($context);
         $token = $tokens["pause"];
 
@@ -517,13 +523,27 @@ final class runner
             );
         }
 
+        $param = $ref->getParameters()[0];
+
         if ($requireContextParamName) {
-            $param = $ref->getParameters()[0];
             if ($param->getName() !== "context") {
                 throw new RuntimeException(
                     "[divengine.runner] Flow function first parameter must be named 'context'."
                 );
             }
+        }
+
+        if (!$param->isPassedByReference()) {
+            throw new RuntimeException(
+                "[divengine.runner] Flow function must pass 'context' by reference as the first parameter."
+            );
+        }
+
+        $type = $param->getType();
+        if ($type instanceof \ReflectionNamedType && $type->getName() !== "array") {
+            throw new RuntimeException(
+                "[divengine.runner] Flow function 'context' parameter type must be array when declared."
+            );
         }
     }
 

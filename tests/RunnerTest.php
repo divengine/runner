@@ -102,6 +102,19 @@ final class RunnerTest extends TestCase
         runner::run($flow, $context);
     }
 
+    public function testRunRejectsFlowWithoutContextByReference(): void
+    {
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage("must pass 'context' by reference");
+
+        $context = [];
+        $flow = function (array $context): void {
+            $context["ran"] = true;
+        };
+
+        runner::run($flow, $context, ["require_context_param_name" => false]);
+    }
+
     public function testImporterLoadsCallableFromExplicitPath(): void
     {
         $projectDir = $this->createTempProject();
@@ -371,6 +384,14 @@ final class RunnerTest extends TestCase
 
         $this->assertSame("blockX", $context["_flow_state"]["block"] ?? null);
         $this->assertSame(12, $context["_flow_state"]["step_index"] ?? null);
+    }
+
+    public function testWrapPauseRejectsMissingContextArgument(): void
+    {
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage("wrapPause requires shared context as the fourth argument");
+
+        runner::wrapPause("blockX", "pause_step", 12);
     }
 
     public function testSafeSerializeHandlesNonSerializableValues(): void
