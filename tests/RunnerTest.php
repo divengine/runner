@@ -8,9 +8,13 @@ use PHPUnit\Framework\TestCase;
 final class RunnerTest extends TestCase
 {
     private array $tempDirs = [];
+    private array $globalLogs = [];
 
     protected function tearDown(): void
     {
+        runner::setLogger(null);
+        $this->globalLogs = [];
+
         foreach ($this->tempDirs as $tempDir) {
             $this->deleteDirectory($tempDir);
         }
@@ -195,6 +199,202 @@ final class RunnerTest extends TestCase
         $this->assertFalse(runner::checkPause(2, $context));
         $this->assertTrue(runner::checkPause(3, $context));
         $this->assertSame([], $context["_flow_state"]);
+    }
+
+    public function testSetLoggerIsUsedByRunWhenNoPerRunLoggerIsProvided(): void
+    {
+        runner::setLogger(function (string $level, string $message): void {
+            $this->globalLogs[] = $level . "|" . $message;
+        });
+
+        $context = [];
+        $flow = function (array &$context): void {
+            $context["ok"] = true;
+        };
+
+        runner::run($flow, $context);
+
+        $this->assertTrue((bool) ($context["ok"] ?? false));
+        $this->assertNotEmpty($this->globalLogs);
+        $this->assertStringContainsString("Starting job execution", implode("\n", $this->globalLogs));
+    }
+
+    public function testImporterMissingFunctionTriggersLoggerPath(): void
+    {
+        $projectDir = $this->createTempProject();
+        $logs = [];
+
+        $callable = runner::importer(
+            "missing_fn_" . bin2hex(random_bytes(4)),
+            "missing_module",
+            $projectDir,
+            function (string $level, string $message) use (&$logs): void {
+                $logs[] = [$level, $message];
+            }
+        );
+
+        $this->assertNull($callable);
+        $this->assertNotEmpty($logs);
+        $this->assertSame("ERROR", $logs[0][0]);
+        $this->assertStringContainsString("Error importing", $logs[0][1]);
+    }
+
+    public function testImporterHandlesRequireErrorAndLogsException(): void
+    {
+        $projectDir = $this->createTempProject();
+        $functionName = "broken_" . bin2hex(random_bytes(4));
+        $brokenPath = $projectDir . DIRECTORY_SEPARATOR . "functions" . DIRECTORY_SEPARATOR . $functionName . ".php";
+        file_put_contents($brokenPath, "<?php this is invalid php");
+
+        $logs = [];
+        $callable = runner::importer(
+            $functionName,
+            "unused_module",
+            $projectDir,
+            function (string $level, string $message, array $context = []) use (&$logs): void {
+                $logs[] = [$level, $message, $context];
+            }
+        );
+
+        $this->assertNull($callable);
+        $this->assertNotEmpty($logs);
+        $this->assertSame("ERROR", $logs[0][0]);
+        $this->assertStringContainsString("Error requiring file", $logs[0][1]);
+        $this->assertArrayHasKey("exception", $logs[0][2]);
+    }
+
+    public function testImporterUsesShortNameFallbackForNamespacedRequest(): void
+    {
+        $projectDir = $this->createTempProject();
+        $namespacedRequest = "a\\b\\flow_" . bin2hex(random_bytes(4));
+        $shortName = basename(str_replace("\\", "/", $namespacedRequest));
+
+        $nestedPath = $projectDir . DIRECTORY_SEPARATOR . "functions" . DIRECTORY_SEPARATOR . "a" . DIRECTORY_SEPARATOR . "b";
+        mkdir($nestedPath, 0777, true);
+
+        $content = "<?php\n";
+        $content .= "function {$shortName}(array &\$context): void\n";
+        $content .= "{\n";
+        $content .= "    \$context['short_name_loaded'] = true;\n";
+        $content .= "}\n";
+        file_put_contents($nestedPath . DIRECTORY_SEPARATOR . $shortName . ".php", $content);
+
+        $callable = runner::importer($namespacedRequest, "unused_module", $projectDir);
+        $context = [];
+        $callable($context);
+
+        $this->assertSame($shortName, $callable);
+        $this->assertTrue((bool) ($context["short_name_loaded"] ?? false));
+    }
+
+    public function testWrappersAndUpdateContextMutateSharedContext(): void
+    {
+        $context = [];
+
+        runner::updateContext($context, ["a" => 1], "s1", 1);
+        $this->assertSame(1, $context["a"]);
+        $this->assertSame("s1", $context["_current_step_id"]);
+        $this->assertSame(1, $context["_current_step_index"]);
+
+        $condResult = runner::wrapCondition(
+            fn (array &$ctx): bool => (($ctx["a"] ?? 0) === 1),
+            "cond",
+            2,
+            $context
+        );
+        $this->assertTrue($condResult);
+
+        runner::wrapActivity(
+            fn (array &$ctx): string => "ok-" . ($ctx["a"] ?? 0),
+            "activity_result",
+            3,
+            $context
+        );
+        $this->assertSame("ok-1", $context["activity_result"]);
+
+        $called = false;
+        runner::wrapCall(
+            function (array &$ctx) use (&$called): void {
+                $called = true;
+                $ctx["call_ran"] = true;
+            },
+            "call",
+            4,
+            $context,
+            "call_target",
+            9
+        );
+        $this->assertTrue($called);
+        $this->assertTrue((bool) ($context["call_ran"] ?? false));
+        $this->assertSame(9, $context["_flow_state"]["step_index"] ?? null);
+    }
+
+    public function testWrapJumpSetsStateAndThrowsJumpToken(): void
+    {
+        $context = [];
+
+        try {
+            runner::wrapJump(
+                function (array &$ctx): void {
+                },
+                "jump_step",
+                7,
+                $context,
+                "go",
+                11
+            );
+            $this->fail("wrapJump must throw");
+        } catch (\RuntimeException $e) {
+            $this->assertStringContainsString("Jump to go", $e->getMessage());
+            $this->assertStringContainsString($context["_exception_jump_token"], $e->getMessage());
+        }
+
+        $this->assertSame(11, $context["_flow_state"]["step_index"] ?? null);
+    }
+
+    public function testWrapPauseSetsStateAndThrowsPauseToken(): void
+    {
+        $context = [];
+
+        try {
+            runner::wrapPause("striderX", "pause_step", 12, $context);
+            $this->fail("wrapPause must throw");
+        } catch (\RuntimeException $e) {
+            $this->assertStringContainsString("Pause at striderX.pause_step[12]", $e->getMessage());
+            $this->assertStringContainsString($context["_exception_pause_token"], $e->getMessage());
+        }
+
+        $this->assertSame("striderX", $context["_flow_state"]["strider"] ?? null);
+        $this->assertSame(12, $context["_flow_state"]["step_index"] ?? null);
+    }
+
+    public function testSafeSerializeHandlesNonSerializableValues(): void
+    {
+        $resource = fopen("php://memory", "r");
+        $stringable = new class {
+            public function __toString(): string
+            {
+                return "stringable";
+            }
+        };
+
+        $data = [
+            "resource" => $resource,
+            "date" => new \DateTimeImmutable("2026-02-12T00:00:00+00:00"),
+            "stringable" => $stringable,
+            "deep" => ["a" => ["b" => ["c" => ["d" => ["e" => ["f" => ["g" => ["h" => ["i" => ["j" => 1]]]]]]]]]],
+        ];
+
+        $json = runner::safeSerialize($data);
+        $decoded = json_decode($json, true, 512, JSON_THROW_ON_ERROR);
+
+        $this->assertIsString($decoded["resource"]);
+        $this->assertStringContainsString("resource(", $decoded["resource"]);
+        $this->assertSame("stringable", $decoded["stringable"]);
+        $this->assertSame("2026-02-12T00:00:00+00:00", $decoded["date"]);
+        $this->assertNull($decoded["deep"]["a"]["b"]["c"]["d"]["e"]["f"]["g"]["h"]["i"] ?? null);
+
+        fclose($resource);
     }
 
     private function createTempProject(): string
