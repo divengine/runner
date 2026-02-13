@@ -105,6 +105,7 @@ final class runner
         $flowDef = self::parseYamlFlowFile($yamlPath);
         $blocks = self::normalizeFlowBlocks($flowDef);
         self::validateFlowBlocks($blocks);
+        $functionsRoot = self::resolveFlowFunctionsRoot($flowDef, $yamlPath, $options);
 
         $initialBlock = $blocks[0]["id"];
         $stepIndexMap = self::buildStepIndexMap($blocks);
@@ -114,7 +115,12 @@ final class runner
 
         $resolvedFunctionPaths = [];
         foreach ($functionRefs as $functionRef) {
-            $resolvedFunctionPaths[$functionRef] = self::resolveFunctionImportPath($functionRef, $yamlPath, $options);
+            $resolvedFunctionPaths[$functionRef] = self::resolveFunctionImportPath(
+                $functionRef,
+                $yamlPath,
+                $functionsRoot,
+                $options
+            );
         }
 
         $lines = [];
@@ -288,7 +294,8 @@ final class runner
      */
     public static function runYaml(string $yamlPath, array &$context, array $options = []): void
     {
-        $flow = self::flowFromYaml($yamlPath, $options);
+        $yamlOptions = self::withYamlRuntimeOptions($options, $context);
+        $flow = self::flowFromYaml($yamlPath, $yamlOptions);
         self::run($flow, $context, $options);
     }
 
@@ -369,7 +376,8 @@ final class runner
         if (is_string($flow)) {
             $extension = strtolower(pathinfo($flow, PATHINFO_EXTENSION));
             if ($extension === "yml" || $extension === "yaml") {
-                $func = self::flowFromYaml($flow, $options);
+                $yamlOptions = self::withYamlRuntimeOptions($options, $context);
+                $func = self::flowFromYaml($flow, $yamlOptions);
             } else {
                 $func = self::importer($flow, $logger);
             }
@@ -715,6 +723,35 @@ final class runner
     }
 
     /**
+     * @param array<string, mixed> $options
+     * @param array<string, mixed> $context
+     *
+     * @return array<string, mixed>
+     */
+    private static function withYamlRuntimeOptions(array $options, array $context): array
+    {
+        $yamlOptions = $options;
+        $hasRootInOptions = isset($yamlOptions["root_folder"])
+            && is_string($yamlOptions["root_folder"])
+            && trim($yamlOptions["root_folder"]) !== "";
+        $hasLegacyInOptions = isset($yamlOptions["functions_path"])
+            && is_string($yamlOptions["functions_path"])
+            && trim($yamlOptions["functions_path"]) !== "";
+
+        if (
+            !$hasRootInOptions
+            && !$hasLegacyInOptions
+            && isset($context["root_folder"])
+            && is_string($context["root_folder"])
+            && trim($context["root_folder"]) !== ""
+        ) {
+            $yamlOptions["root_folder"] = trim($context["root_folder"]);
+        }
+
+        return $yamlOptions;
+    }
+
+    /**
      * @param string $yamlPath
      *
      * @return array<string, mixed>
@@ -960,7 +997,50 @@ final class runner
         return $stepIndexMap;
     }
 
-    private static function resolveFunctionImportPath(string $reference, string $yamlPath, array $options): string
+    /**
+     * @param array<string, mixed> $flowDef
+     * @param array<string, mixed> $options
+     */
+    private static function resolveFlowFunctionsRoot(array $flowDef, string $yamlPath, array $options): string
+    {
+        $yamlDir = dirname($yamlPath);
+
+        $fromOptions = isset($options["root_folder"]) && is_string($options["root_folder"])
+            ? trim($options["root_folder"])
+            : "";
+        if ($fromOptions !== "") {
+            return self::isAbsolutePath($fromOptions)
+                ? $fromOptions
+                : self::joinPath($yamlDir, $fromOptions);
+        }
+
+        $legacyFunctionsPath = isset($options["functions_path"]) && is_string($options["functions_path"])
+            ? trim($options["functions_path"])
+            : "";
+        if ($legacyFunctionsPath !== "") {
+            return self::isAbsolutePath($legacyFunctionsPath)
+                ? $legacyFunctionsPath
+                : self::joinPath($yamlDir, $legacyFunctionsPath);
+        }
+
+        $fromYaml = isset($flowDef["root_folder"]) && is_string($flowDef["root_folder"])
+            ? trim($flowDef["root_folder"])
+            : "";
+        if ($fromYaml !== "") {
+            return self::isAbsolutePath($fromYaml)
+                ? $fromYaml
+                : self::joinPath($yamlDir, $fromYaml);
+        }
+
+        return $yamlDir;
+    }
+
+    private static function resolveFunctionImportPath(
+        string $reference,
+        string $yamlPath,
+        string $functionsRoot,
+        array $options
+    ): string
     {
         $map = [];
         if (isset($options["function_map"]) && is_array($options["function_map"])) {
@@ -983,20 +1063,7 @@ final class runner
             return $trimmedReference;
         }
 
-        $functionsPath = isset($options["functions_path"]) && is_string($options["functions_path"])
-            ? trim($options["functions_path"])
-            : "";
-
-        if (
-            $functionsPath !== ""
-            && !str_contains($trimmedReference, "/")
-            && !str_contains($trimmedReference, "\\")
-            && !str_starts_with($trimmedReference, ".")
-        ) {
-            return self::joinPath($functionsPath, $trimmedReference);
-        }
-
-        return self::joinPath(dirname($yamlPath), $trimmedReference);
+        return self::joinPath($functionsRoot, $trimmedReference);
     }
 
     /**

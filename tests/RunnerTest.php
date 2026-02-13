@@ -267,6 +267,38 @@ final class RunnerTest extends TestCase
         $this->assertFileExists($targetFile);
     }
 
+    public function testRunYamlUsesRootFolderFromInitialContext(): void
+    {
+        $tempDir = $this->createTempProject();
+        $yamlPath = $tempDir . DIRECTORY_SEPARATOR . "flow-from-context-root.yml";
+
+        $yaml = <<<YAML
+id: context-root-sample
+blocks:
+  main:
+    steps:
+      sum_step:
+        activity: add_values
+      normalize_text:
+        activity: uppercase_text
+YAML;
+
+        file_put_contents($yamlPath, $yaml);
+
+        $context = [
+            "left" => 9,
+            "right" => 1,
+            "text" => "context root",
+            "root_folder" => __DIR__ . DIRECTORY_SEPARATOR . "activities",
+        ];
+
+        runner::run($yamlPath, $context);
+
+        $this->assertSame("done", $context["_runner_state"] ?? null);
+        $this->assertSame(10, $context["sum"] ?? null);
+        $this->assertSame("CONTEXT ROOT", $context["upper_text"] ?? null);
+    }
+
     public function testFlowLoopHandlesJumpTokenAndContinuesWithSavedBlock(): void
     {
         $context = [];

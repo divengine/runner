@@ -43,6 +43,8 @@ runner::run(__DIR__ . "/flows/sample.yml", $context);
 
 `runner::run()` auto-compiles `.yml`/`.yaml` files to callable flows, and you can also use `runner::runYaml()` explicitly.
 
+In YAML flows, `activity`/`condition` names can omit `.php`, and function lookup can be rooted with `root_folder` (in YAML, options, or initial context).
+
 ## Documentation
 
 See `docs/README.md` for extended notes on context keys and helpers.

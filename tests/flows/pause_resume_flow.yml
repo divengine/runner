@@ -1,19 +1,20 @@
 id: pause-resume-flow
 description: Pause and resume fixture in YAML format
+root_folder: ../activities
 blocks:
   main:
     steps:
       sum_step:
-        activity: ../activities/add_values.php
+        activity: add_values
 
       pause_once:
-        condition: ../activities/should_pause_once.php
+        condition: should_pause_once
         context:
           pause_once_done: true
         pause: true
 
       uppercase_step:
-        activity: ../activities/uppercase_text.php
+        activity: uppercase_text
 
       set_flow_result:
         context:
