@@ -1,6 +1,5 @@
 id: pause-resume-flow
 description: Pause and resume fixture in YAML format
-root_folder: ../activities
 blocks:
   main:
     steps:

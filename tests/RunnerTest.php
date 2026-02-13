@@ -199,6 +199,7 @@ final class RunnerTest extends TestCase
             "customer_name" => "rafa",
             "enable_audit" => true,
             "target_file" => $targetFile,
+            "_root_folder" => __DIR__ . DIRECTORY_SEPARATOR . "activities",
         ];
 
         runner::run($flowPath, $context);
@@ -224,6 +225,7 @@ final class RunnerTest extends TestCase
             "left" => 10,
             "right" => 2,
             "text" => "hold me",
+            "_root_folder" => __DIR__ . DIRECTORY_SEPARATOR . "activities",
         ];
 
         runner::run($flowPath, $context);
@@ -256,6 +258,7 @@ final class RunnerTest extends TestCase
             "customer_name" => "rafageist",
             "enable_audit" => false,
             "target_file" => $targetFile,
+            "_root_folder" => __DIR__ . DIRECTORY_SEPARATOR . "activities",
         ];
 
         runner::runYaml($flowPath, $context);
@@ -289,7 +292,7 @@ YAML;
             "left" => 9,
             "right" => 1,
             "text" => "context root",
-            "root_folder" => __DIR__ . DIRECTORY_SEPARATOR . "activities",
+            "_root_folder" => __DIR__ . DIRECTORY_SEPARATOR . "activities",
         ];
 
         runner::run($yamlPath, $context);

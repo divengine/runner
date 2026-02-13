@@ -1,6 +1,5 @@
 id: business-flow
 description: Business flow fixture in YAML format
-root_folder: ../activities
 blocks:
   main:
     steps:

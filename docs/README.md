@@ -79,14 +79,16 @@ Available YAML APIs:
 Flow format notes:
 
 - Root uses `blocks` as the container of flow blocks.
-- Root can define `root_folder` to resolve `activity`/`condition` files.
 - `activity` and `condition` values can omit `.php` extension.
 - `call` and `jump` references use `block.step` syntax.
 - `activity` and `condition` are imported as PHP callables through the standard importer.
 
-`root_folder` precedence during YAML execution:
+Function root precedence during YAML execution:
 
-1. `options["root_folder"]` (or legacy `options["functions_path"]`)
-2. initial context `root_folder`
-3. YAML top-level `root_folder`
-4. YAML file directory
+1. initial context `_root_folder`
+2. `DIV_RUNNER_ROOT_FOLDER` constant (fallback to `PACKAGES`, then `src/`)
+
+Notes:
+
+- `_root_folder` is a reserved runner context key.
+- `options["root_folder"]` and `options["functions_path"]` are still accepted as defaults, but `_root_folder` has priority.
