@@ -25,7 +25,7 @@ use Symfony\Component\Yaml\Exception\ParseException;
 use Symfony\Component\Yaml\Yaml;
 use Throwable;
 
-defined('DIV_RUNNER_ROOT_FOLDER') or define('DIV_RUNNER_ROOT_FOLDER', 'src/');
+defined('DIV_RUNNER_ROOT_FOLDER') or define('DIV_RUNNER_ROOT_FOLDER', './');
 
 final class runner
 {
@@ -1010,7 +1010,7 @@ final class runner
             return trim(DIV_RUNNER_ROOT_FOLDER);
         }
 
-        return 'src/';
+        return './';
     }
 
     /**
