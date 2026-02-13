@@ -1,6 +1,6 @@
 id: business-flow
 description: Business flow fixture in YAML format
-striders:
+blocks:
   main:
     steps:
       sum_step:

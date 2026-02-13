@@ -761,10 +761,10 @@ final class runner
      */
     private static function normalizeFlowBlocks(array $flowDef): array
     {
-        $blocksRaw = $flowDef["striders"] ?? $flowDef["blocks"] ?? null;
+        $blocksRaw = $flowDef["blocks"] ?? null;
         if (!is_array($blocksRaw)) {
             throw new RuntimeException(
-                "[divengine.runner] Invalid YAML flow format: 'striders' or 'blocks' must be defined."
+                "[divengine.runner] Invalid YAML flow format: 'blocks' must be defined."
             );
         }
 

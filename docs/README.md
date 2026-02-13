@@ -78,6 +78,6 @@ Available YAML APIs:
 
 Flow format notes:
 
-- Root supports `striders` and `blocks` keys.
+- Root uses `blocks` as the container of flow blocks.
 - `call` and `jump` references use `block.step` syntax.
 - `activity` and `condition` are imported as PHP callables through the standard importer.

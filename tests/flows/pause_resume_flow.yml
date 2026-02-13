@@ -1,6 +1,6 @@
 id: pause-resume-flow
 description: Pause and resume fixture in YAML format
-striders:
+blocks:
   main:
     steps:
       sum_step:
