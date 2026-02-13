@@ -85,10 +85,11 @@ Flow format notes:
 
 Function root precedence during YAML execution:
 
-1. initial context `_root_folder`
-2. `DIV_RUNNER_ROOT_FOLDER` constant (fallback to `PACKAGES`, then `src/`)
+1. context `_root_folder` (evaluated at each import call)
+2. `DIV_RUNNER_ROOT_FOLDER` constant (default `./`)
+3. fallback `./`
 
 Notes:
 
 - `_root_folder` is a reserved runner context key.
-- `options["root_folder"]` and `options["functions_path"]` are still accepted as defaults, but `_root_folder` has priority.
+- Importer first tries PHP files, and if no file resolves it also accepts callable identifiers (global or namespaced functions already available in runtime/autoload).

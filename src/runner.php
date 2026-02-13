@@ -49,49 +49,61 @@ final class runner
     }
 
     /**
-     * Imports a callable from a PHP file path.
+     * Imports a callable from file path or callable identifier.
      *
-     * The target file must `return` a callable. The `.php` extension is optional.
+     * File resolution happens at runtime using `_root_folder` from context
+     * (if present), otherwise `DIV_RUNNER_ROOT_FOLDER`.
      *
-     * @param string        $path   Absolute or relative path to the PHP file.
-     * @param callable|null $logger Optional logger callback.
+     * @param string              $path
+     * @param callable|null       $logger
+     * @param array<string, mixed> $context
      *
      * @return callable|null
      */
-    public static function importer(string $path, ?callable $logger = null): ?callable
+    public static function importer(string $path, ?callable $logger = null, array $context = []): ?callable
     {
         $logger = $logger ?? self::$loggerSink;
 
-        $resolvedPath = trim($path);
-        if ($resolvedPath === "") {
+        $reference = trim($path);
+        if ($reference === "") {
             self::emitLog($logger, "ERROR", "Import path is empty.");
             return null;
         }
 
-        if (!str_ends_with(strtolower($resolvedPath), ".php")) {
-            $resolvedPath .= ".php";
+        $callableReference = ltrim($reference, "\\");
+        if (is_callable($callableReference)) {
+            return $callableReference;
         }
 
-        if (!is_file($resolvedPath)) {
-            self::emitLog($logger, "ERROR", "Import file not found: {$resolvedPath}");
-            return null;
+        $candidates = self::buildImportPathCandidates($reference, $context);
+        foreach ($candidates as $candidate) {
+            if (!is_file($candidate)) {
+                continue;
+            }
+
+            try {
+                $func = require $candidate;
+            } catch (Throwable $e) {
+                self::emitLog($logger, "ERROR", "Error requiring file: {$candidate}", [
+                    "exception" => self::dumpException($e),
+                ]);
+                return null;
+            }
+
+            if (!is_callable($func)) {
+                self::emitLog($logger, "ERROR", "Import file must return a callable: {$candidate}");
+                return null;
+            }
+
+            return $func;
         }
 
-        try {
-            $func = require $resolvedPath;
-        } catch (Throwable $e) {
-            self::emitLog($logger, "ERROR", "Error requiring file: {$resolvedPath}", [
-                "exception" => self::dumpException($e),
-            ]);
-            return null;
+        if (is_callable($callableReference)) {
+            return $callableReference;
         }
 
-        if (!is_callable($func)) {
-            self::emitLog($logger, "ERROR", "Import file must return a callable: {$resolvedPath}");
-            return null;
-        }
-
-        return $func;
+        self::emitLog($logger, "ERROR", "Import target not found or not callable: {$reference}");
+        return null;
     }
 
     /**
@@ -107,7 +119,6 @@ final class runner
         $flowDef = self::parseYamlFlowFile($yamlPath);
         $blocks = self::normalizeFlowBlocks($flowDef);
         self::validateFlowBlocks($blocks);
-        $functionsRoot = self::resolveFlowFunctionsRoot($options);
 
         $initialBlock = $blocks[0]["id"];
         $stepIndexMap = self::buildStepIndexMap($blocks);
@@ -116,8 +127,6 @@ final class runner
             : [];
 
         $lines = [];
-        $yamlPathCode = var_export($yamlPath, true);
-        $functionsRootCode = var_export($functionsRoot, true);
         $functionMapCode = var_export($functionMap, true);
         $lines[] = "return function (array &\$context): void {";
         $lines[] = "    \$importer = \$context[\"_importer\"] ?? null;";
@@ -144,29 +153,18 @@ final class runner
         $lines[] = "        throw new \\RuntimeException(\"Missing flow helpers in context.\");";
         $lines[] = "    }";
         $lines[] = "";
-        $lines[] = "    \$yamlPath = {$yamlPathCode};";
-        $lines[] = "    \$defaultFunctionsRoot = {$functionsRootCode};";
         $lines[] = "    \$functionMap = {$functionMapCode};";
-        $lines[] = "    \$functions = [];";
-        $lines[] = "    \$resolveFunction = function (string \$reference) use (&\$functions, \$importer, \$yamlPath, \$defaultFunctionsRoot, \$functionMap, &\$context): callable {";
-        $lines[] = "        \$path = \\divengine\\runner\\runner::resolveYamlFunctionImportPath(";
-        $lines[] = "            \$reference,";
-        $lines[] = "            \$yamlPath,";
-        $lines[] = "            \$defaultFunctionsRoot,";
-        $lines[] = "            \$functionMap,";
-        $lines[] = "            \$context";
-        $lines[] = "        );";
-        $lines[] = "";
-        $lines[] = "        if (isset(\$functions[\$path]) && is_callable(\$functions[\$path])) {";
-        $lines[] = "            return \$functions[\$path];";
+        $lines[] = "    \$resolveFunction = function (string \$reference) use (\$importer, \$functionMap): callable {";
+        $lines[] = "        \$mapped = \$reference;";
+        $lines[] = "        if (isset(\$functionMap[\$reference]) && is_string(\$functionMap[\$reference]) && trim(\$functionMap[\$reference]) !== \"\") {";
+        $lines[] = "            \$mapped = trim(\$functionMap[\$reference]);";
         $lines[] = "        }";
         $lines[] = "";
-        $lines[] = "        \$callable = \$importer(\$path);";
+        $lines[] = "        \$callable = \$importer(\$mapped);";
         $lines[] = "        if (!is_callable(\$callable)) {";
-        $lines[] = "            throw new \\RuntimeException(\"Function import failed: \" . \$reference . \" @ \" . \$path);";
+        $lines[] = "            throw new \\RuntimeException(\"Function import failed: \" . \$reference);";
         $lines[] = "        }";
         $lines[] = "";
-        $lines[] = "        \$functions[\$path] = \$callable;";
         $lines[] = "        return \$callable;";
         $lines[] = "    };";
         $lines[] = "";
@@ -305,8 +303,7 @@ final class runner
      */
     public static function runYaml(string $yamlPath, array &$context, array $options = []): void
     {
-        $yamlOptions = self::withYamlRuntimeOptions($options, $context);
-        $flow = self::flowFromYaml($yamlPath, $yamlOptions);
+        $flow = self::flowFromYaml($yamlPath, $options);
         self::run($flow, $context, $options);
     }
 
@@ -352,9 +349,10 @@ final class runner
         // Expose helper callbacks inside context for flow/activity/condition files.
         $context["_logger"] = $logger;
         $context["_importer"] = function (string $path, ?string $unused = null) use (
-            $logger
+            $logger,
+            &$context
         ): ?callable {
-            return self::importer($path, $logger);
+            return self::importer($path, $logger, $context);
         };
 
         $context["_update_context"] = [self::class, "updateContext"];
@@ -387,10 +385,9 @@ final class runner
         if (is_string($flow)) {
             $extension = strtolower(pathinfo($flow, PATHINFO_EXTENSION));
             if ($extension === "yml" || $extension === "yaml") {
-                $yamlOptions = self::withYamlRuntimeOptions($options, $context);
-                $func = self::flowFromYaml($flow, $yamlOptions);
+                $func = self::flowFromYaml($flow, $options);
             } else {
-                $func = self::importer($flow, $logger);
+                $func = self::importer($flow, $logger, $context);
             }
         }
 
@@ -734,43 +731,6 @@ final class runner
     }
 
     /**
-     * @param array<string, mixed> $options
-     * @param array<string, mixed> $context
-     *
-     * @return array<string, mixed>
-     */
-    private static function withYamlRuntimeOptions(array $options, array $context): array
-    {
-        $yamlOptions = $options;
-        $hasRootInOptions = isset($yamlOptions["root_folder"])
-            && is_string($yamlOptions["root_folder"])
-            && trim($yamlOptions["root_folder"]) !== "";
-        $hasLegacyInOptions = isset($yamlOptions["functions_path"])
-            && is_string($yamlOptions["functions_path"])
-            && trim($yamlOptions["functions_path"]) !== "";
-
-        if (
-            !$hasRootInOptions
-            && !$hasLegacyInOptions
-            && isset($context["_root_folder"])
-            && is_string($context["_root_folder"])
-            && trim($context["_root_folder"]) !== ""
-        ) {
-            $yamlOptions["root_folder"] = trim($context["_root_folder"]);
-        } elseif (
-            !$hasRootInOptions
-            && !$hasLegacyInOptions
-            && isset($context["root_folder"])
-            && is_string($context["root_folder"])
-            && trim($context["root_folder"]) !== ""
-        ) {
-            $yamlOptions["root_folder"] = trim($context["root_folder"]);
-        }
-
-        return $yamlOptions;
-    }
-
-    /**
      * @param string $yamlPath
      *
      * @return array<string, mixed>
@@ -988,22 +948,43 @@ final class runner
     }
 
     /**
-     * @param array<string, mixed> $options
+     * @param array<string, mixed> $context
+     *
+     * @return array<int, string>
      */
-    private static function resolveFlowFunctionsRoot(array $options): string
+    private static function buildImportPathCandidates(string $reference, array $context): array
     {
-        $fromOptions = isset($options["root_folder"]) && is_string($options["root_folder"])
-            ? trim($options["root_folder"])
-            : "";
-        if ($fromOptions !== "") {
-            return $fromOptions;
+        $rootFolder = self::resolveImporterRootFolder($context);
+        $rawCandidates = [];
+
+        if (self::isAbsolutePath($reference)) {
+            $rawCandidates[] = $reference;
+        } else {
+            $rawCandidates[] = self::joinPath($rootFolder, $reference);
+            $rawCandidates[] = $reference;
         }
 
-        $legacyFunctionsPath = isset($options["functions_path"]) && is_string($options["functions_path"])
-            ? trim($options["functions_path"])
+        $candidates = [];
+        foreach ($rawCandidates as $candidate) {
+            $withExtension = self::ensurePhpExtension($candidate);
+            if (!in_array($withExtension, $candidates, true)) {
+                $candidates[] = $withExtension;
+            }
+        }
+
+        return $candidates;
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private static function resolveImporterRootFolder(array $context): string
+    {
+        $contextRoot = isset($context["_root_folder"]) && is_string($context["_root_folder"])
+            ? trim($context["_root_folder"])
             : "";
-        if ($legacyFunctionsPath !== "") {
-            return $legacyFunctionsPath;
+        if ($contextRoot !== "") {
+            return $contextRoot;
         }
 
         if (defined('DIV_RUNNER_ROOT_FOLDER') && is_string(DIV_RUNNER_ROOT_FOLDER) && trim(DIV_RUNNER_ROOT_FOLDER) !== '') {
@@ -1013,61 +994,13 @@ final class runner
         return './';
     }
 
-    /**
-     * Resolves an activity/condition reference from YAML into an importer path.
-     *
-     * @param array<string, mixed> $functionMap
-     * @param array<string, mixed> $context
-     */
-    public static function resolveYamlFunctionImportPath(
-        string $reference,
-        string $yamlPath,
-        string $defaultFunctionsRoot,
-        array $functionMap = [],
-        array $context = []
-    ): string
+    private static function ensurePhpExtension(string $path): string
     {
-        if (isset($functionMap[$reference]) && is_string($functionMap[$reference]) && trim($functionMap[$reference]) !== "") {
-            $mappedPath = trim($functionMap[$reference]);
-            if (self::isAbsolutePath($mappedPath)) {
-                return $mappedPath;
-            }
-            return self::joinPath(dirname($yamlPath), $mappedPath);
+        if (str_ends_with(strtolower($path), ".php")) {
+            return $path;
         }
 
-        $trimmedReference = trim($reference);
-        if ($trimmedReference === "") {
-            return $trimmedReference;
-        }
-
-        if (self::isAbsolutePath($trimmedReference)) {
-            return $trimmedReference;
-        }
-
-        if (
-            str_contains($trimmedReference, "/")
-            || str_contains($trimmedReference, "\\")
-            || str_starts_with($trimmedReference, ".")
-        ) {
-            return self::joinPath(dirname($yamlPath), $trimmedReference);
-        }
-
-        $contextRoot = isset($context["_root_folder"]) && is_string($context["_root_folder"])
-            ? trim($context["_root_folder"])
-            : "";
-        if (
-            $contextRoot === ""
-            && isset($context["root_folder"])
-            && is_string($context["root_folder"])
-            && trim($context["root_folder"]) !== ""
-        ) {
-            $contextRoot = trim($context["root_folder"]);
-        }
-        if ($contextRoot !== "") {
-            return self::joinPath($contextRoot, $trimmedReference);
-        }
-
-        return self::joinPath($defaultFunctionsRoot, $trimmedReference);
+        return $path . ".php";
     }
 
     /**

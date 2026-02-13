@@ -386,7 +386,85 @@ YAML;
         $this->assertNull($callable);
         $this->assertNotEmpty($logs);
         $this->assertSame("ERROR", $logs[0][0]);
-        $this->assertStringContainsString("Import file not found", $logs[0][1]);
+        $this->assertStringContainsString("Import target not found or not callable", $logs[0][1]);
+    }
+
+    public function testImporterFallsBackToGlobalCallableIdentifier(): void
+    {
+        $callable = runner::importer("strlen");
+        $this->assertIsCallable($callable);
+        $this->assertSame(4, $callable("flow"));
+    }
+
+    public function testImporterAcceptsNamespacedCallableIdentifier(): void
+    {
+        $functionName = "fn_" . bin2hex(random_bytes(4));
+        $reference = "divengine\\runner\\tests\\{$functionName}";
+
+        eval(
+            "namespace divengine\\runner\\tests; " .
+            "function {$functionName}(array &\$context): void { " .
+            "\$context['namespaced_callable_loaded'] = true; " .
+            "}"
+        );
+
+        $callable = runner::importer($reference);
+        $this->assertIsCallable($callable);
+
+        $context = [
+            "namespaced_callable_loaded" => false,
+        ];
+        $callable($context);
+        $this->assertTrue($context["namespaced_callable_loaded"]);
+    }
+
+    public function testRunYamlResolvesActivitiesUsingRuntimeRootFolder(): void
+    {
+        $tempDir = $this->createTempProject();
+        $rootA = $tempDir . DIRECTORY_SEPARATOR . "root_a";
+        $rootB = $tempDir . DIRECTORY_SEPARATOR . "root_b";
+        mkdir($rootA, 0777, true);
+        mkdir($rootB, 0777, true);
+
+        file_put_contents(
+            $rootA . DIRECTORY_SEPARATOR . "switch_root.php",
+            "<?php\nreturn function (array &\$context): void {\n" .
+            "    \$context['_root_folder'] = " . var_export($rootB, true) . ";\n" .
+            "    \$context['root_switched'] = true;\n" .
+            "};\n"
+        );
+
+        file_put_contents(
+            $rootB . DIRECTORY_SEPARATOR . "load_from_new_root.php",
+            "<?php\nreturn function (array &\$context): void {\n" .
+            "    \$context['loaded_from_runtime_root'] = true;\n" .
+            "};\n"
+        );
+
+        $yamlPath = $tempDir . DIRECTORY_SEPARATOR . "runtime-root.yml";
+        $yaml = <<<YAML
+id: runtime-root-flow
+blocks:
+  main:
+    steps:
+      set_root:
+        activity: switch_root
+      load_next:
+        activity: load_from_new_root
+YAML;
+
+        file_put_contents($yamlPath, $yaml);
+
+        $context = [
+            "_root_folder" => $rootA,
+        ];
+
+        runner::run($yamlPath, $context);
+
+        $this->assertSame("done", $context["_runner_state"] ?? null);
+        $this->assertTrue((bool) ($context["root_switched"] ?? false));
+        $this->assertTrue((bool) ($context["loaded_from_runtime_root"] ?? false));
+        $this->assertSame($rootB, $context["_root_folder"] ?? null);
     }
 
     public function testImporterHandlesRequireErrorAndLogsException(): void
