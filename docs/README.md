@@ -48,3 +48,36 @@ The runner injects helpers into the context for flow control:
 - `__flow_loop` for block-style execution
 
 These helpers mirror the logic in the original Python runner.
+
+## YAML Flows
+
+The runner can generate and execute flow callables directly from YAML definitions:
+
+```php
+use divengine\runner\runner;
+
+$context = [
+    "left" => 4,
+    "right" => 6,
+];
+
+runner::runYaml(__DIR__ . "/flows/sample.yml", $context);
+```
+
+You can also call `runner::run()` with a `.yml`/`.yaml` path and it will compile the flow on the fly:
+
+```php
+runner::run(__DIR__ . "/flows/sample.yml", $context);
+```
+
+Available YAML APIs:
+
+- `runner::generateFlowCodeFromYaml(string $yamlPath, array $options = []): string`
+- `runner::flowFromYaml(string $yamlPath, array $options = []): callable`
+- `runner::runYaml(string $yamlPath, array &$context, array $options = []): void`
+
+Flow format notes:
+
+- Root supports `striders` and `blocks` keys.
+- `call` and `jump` references use `block.step` syntax.
+- `activity` and `condition` are imported as PHP callables through the standard importer.

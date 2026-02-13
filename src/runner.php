@@ -2,7 +2,7 @@
 declare(strict_types=1);
 
 /**
- * divengine runner.
+ * Divengine PHP Runner.
  *
  * Lightweight job runner for flow functions that share a mutable context array.
  * Flow/activity/condition files are imported by path and must return callables.
@@ -19,7 +19,10 @@ use DateTimeInterface;
 use ReflectionFunction;
 use ReflectionFunctionAbstract;
 use ReflectionMethod;
+use ReflectionNamedType;
 use RuntimeException;
+use Symfony\Component\Yaml\Exception\ParseException;
+use Symfony\Component\Yaml\Yaml;
 use Throwable;
 
 final class runner
@@ -87,6 +90,206 @@ final class runner
         }
 
         return $func;
+    }
+
+    /**
+     * Generates PHP closure code from a YAML flow file.
+     *
+     * @param string $yamlPath
+     * @param array  $options
+     *
+     * @return string
+     */
+    public static function generateFlowCodeFromYaml(string $yamlPath, array $options = []): string
+    {
+        $flowDef = self::parseYamlFlowFile($yamlPath);
+        $blocks = self::normalizeFlowBlocks($flowDef);
+        self::validateFlowBlocks($blocks);
+
+        $initialBlock = $blocks[0]["id"];
+        $stepIndexMap = self::buildStepIndexMap($blocks);
+
+        $functionRefs = self::collectFunctionReferences($blocks);
+        sort($functionRefs);
+
+        $resolvedFunctionPaths = [];
+        foreach ($functionRefs as $functionRef) {
+            $resolvedFunctionPaths[$functionRef] = self::resolveFunctionImportPath($functionRef, $yamlPath, $options);
+        }
+
+        $lines = [];
+        $lines[] = "return function (array &\$context): void {";
+        $lines[] = "    \$importer = \$context[\"_importer\"] ?? null;";
+        $lines[] = "    \$flowLoop = \$context[\"__flow_loop\"] ?? null;";
+        $lines[] = "    \$checkPause = \$context[\"_check_pause\"] ?? null;";
+        $lines[] = "    \$updateContext = \$context[\"_update_context\"] ?? null;";
+        $lines[] = "    \$wrapCondition = \$context[\"_wrap_condition\"] ?? null;";
+        $lines[] = "    \$wrapActivity = \$context[\"_wrap_activity\"] ?? null;";
+        $lines[] = "    \$wrapCall = \$context[\"_wrap_call\"] ?? null;";
+        $lines[] = "    \$wrapJump = \$context[\"_wrap_jump\"] ?? null;";
+        $lines[] = "    \$wrapPause = \$context[\"_wrap_pause\"] ?? null;";
+        $lines[] = "";
+        $lines[] = "    if (";
+        $lines[] = "        !is_callable(\$importer)";
+        $lines[] = "        || !is_callable(\$flowLoop)";
+        $lines[] = "        || !is_callable(\$checkPause)";
+        $lines[] = "        || !is_callable(\$updateContext)";
+        $lines[] = "        || !is_callable(\$wrapCondition)";
+        $lines[] = "        || !is_callable(\$wrapActivity)";
+        $lines[] = "        || !is_callable(\$wrapCall)";
+        $lines[] = "        || !is_callable(\$wrapJump)";
+        $lines[] = "        || !is_callable(\$wrapPause)";
+        $lines[] = "    ) {";
+        $lines[] = "        throw new \\RuntimeException(\"Missing flow helpers in context.\");";
+        $lines[] = "    }";
+        $lines[] = "";
+        $lines[] = "    \$functions = [];";
+
+        foreach ($resolvedFunctionPaths as $functionRef => $functionPath) {
+            $refCode = var_export($functionRef, true);
+            $pathCode = var_export($functionPath, true);
+            $lines[] = "    \$functions[{$refCode}] = \$importer({$pathCode});";
+            $lines[] = "    if (!is_callable(\$functions[{$refCode}])) {";
+            $lines[] = "        throw new \\RuntimeException(\"Function import failed: \" . {$refCode});";
+            $lines[] = "    }";
+        }
+
+        foreach ($blocks as $block) {
+            $blockId = $block["id"];
+            $blockIdCode = var_export($blockId, true);
+            $contextBlockKeyCode = var_export("_" . $blockId, true);
+            $lines[] = "";
+            $lines[] = "    \$context[{$contextBlockKeyCode}] = function (array &\$context) use (";
+            $lines[] = "        \$checkPause,";
+            $lines[] = "        \$updateContext,";
+            $lines[] = "        \$wrapCondition,";
+            $lines[] = "        \$wrapActivity,";
+            $lines[] = "        \$wrapCall,";
+            $lines[] = "        \$wrapJump,";
+            $lines[] = "        \$wrapPause,";
+            $lines[] = "        \$functions";
+            $lines[] = "    ): mixed {";
+
+            $steps = $block["steps"];
+            foreach ($steps as $stepPosition => $step) {
+                $stepIdx = $stepPosition + 1;
+                $stepIdCode = var_export($step["id"], true);
+                $lines[] = "        if (\$checkPause({$stepIdx}, \$context)) {";
+                $indent = "            ";
+
+                $conditionRef = isset($step["condition"]) && is_string($step["condition"])
+                    ? trim($step["condition"])
+                    : "";
+                if ($conditionRef !== "") {
+                    $conditionRefCode = var_export($conditionRef, true);
+                    $lines[] = "            if (\$wrapCondition(\$functions[{$conditionRefCode}], {$stepIdCode}, {$stepIdx}, \$context)) {";
+                    $indent = "                ";
+                }
+
+                if (isset($step["context"]) && is_array($step["context"])) {
+                    $stepContextCode = var_export($step["context"], true);
+                    $lines[] = "{$indent}\$updateContext(\$context, {$stepContextCode}, {$stepIdCode}, {$stepIdx});";
+                }
+
+                $callRef = isset($step["call"]) && is_string($step["call"]) ? trim($step["call"]) : "";
+                if ($callRef !== "") {
+                    [$targetBlock, $targetIndex] = self::resolveBlockTarget($callRef, $blockId, $stepIndexMap, "call");
+                    $targetCallableKeyCode = var_export("_" . $targetBlock, true);
+                    $targetBlockCode = var_export($targetBlock, true);
+                    $lines[] = "{$indent}\$targetCallable = \$context[{$targetCallableKeyCode}] ?? null;";
+                    $lines[] = "{$indent}if (!is_callable(\$targetCallable)) {";
+                    $lines[] = "{$indent}    throw new \\RuntimeException(\"Missing block callable for \" . {$targetCallableKeyCode});";
+                    $lines[] = "{$indent}}";
+                    $lines[] = "{$indent}\$wrapCall(\$targetCallable, {$stepIdCode}, {$stepIdx}, \$context, {$targetBlockCode}, {$targetIndex});";
+                }
+
+                $activityRef = isset($step["activity"]) && is_string($step["activity"])
+                    ? trim($step["activity"])
+                    : "";
+                if ($activityRef !== "") {
+                    $activityRefCode = var_export($activityRef, true);
+                    $lines[] = "{$indent}\$wrapActivity(\$functions[{$activityRefCode}], {$stepIdCode}, {$stepIdx}, \$context);";
+                }
+
+                $jumpRef = isset($step["jump"]) && is_string($step["jump"]) ? trim($step["jump"]) : "";
+                if ($jumpRef !== "") {
+                    [$targetBlock, $targetIndex] = self::resolveBlockTarget($jumpRef, $blockId, $stepIndexMap, "jump");
+                    $targetCallableKeyCode = var_export("_" . $targetBlock, true);
+                    $targetBlockCode = var_export($targetBlock, true);
+                    $lines[] = "{$indent}\$targetCallable = \$context[{$targetCallableKeyCode}] ?? null;";
+                    $lines[] = "{$indent}if (!is_callable(\$targetCallable)) {";
+                    $lines[] = "{$indent}    throw new \\RuntimeException(\"Missing block callable for \" . {$targetCallableKeyCode});";
+                    $lines[] = "{$indent}}";
+                    $lines[] = "{$indent}\$wrapJump(\$targetCallable, {$stepIdCode}, {$stepIdx}, \$context, {$targetBlockCode}, {$targetIndex});";
+                }
+
+                $pause = isset($step["pause"]) && $step["pause"] === true;
+                if ($pause) {
+                    $lines[] = "{$indent}\$wrapPause({$blockIdCode}, {$stepIdCode}, {$stepIdx}, \$context);";
+                }
+
+                if ($conditionRef !== "") {
+                    $lines[] = "            }";
+                }
+
+                $lines[] = "        }";
+                $lines[] = "";
+            }
+
+            $lines[] = "        return null;";
+            $lines[] = "    };";
+        }
+
+        $initialBlockCode = var_export($initialBlock, true);
+        $lines[] = "";
+        $lines[] = "    \$flowLoop({$initialBlockCode}, \$context);";
+        $lines[] = "};";
+
+        return implode("\n", $lines);
+    }
+
+    /**
+     * Compiles a YAML flow file into a callable closure.
+     *
+     * @param string $yamlPath
+     * @param array  $options
+     *
+     * @return callable
+     */
+    public static function flowFromYaml(string $yamlPath, array $options = []): callable
+    {
+        $code = self::generateFlowCodeFromYaml($yamlPath, $options);
+
+        try {
+            $flow = eval($code);
+        } catch (Throwable $e) {
+            throw new RuntimeException(
+                "[divengine.runner] Failed to compile generated YAML flow from '{$yamlPath}': " . $e->getMessage(),
+                0,
+                $e
+            );
+        }
+
+        if (!is_callable($flow)) {
+            throw new RuntimeException(
+                "[divengine.runner] Generated YAML flow from '{$yamlPath}' is not callable."
+            );
+        }
+
+        return $flow;
+    }
+
+    /**
+     * Generates and runs a flow directly from a YAML definition file.
+     *
+     * @param string $yamlPath
+     * @param array  $context
+     * @param array  $options
+     */
+    public static function runYaml(string $yamlPath, array &$context, array $options = []): void
+    {
+        $flow = self::flowFromYaml($yamlPath, $options);
+        self::run($flow, $context, $options);
     }
 
     /**
@@ -164,7 +367,12 @@ final class runner
 
         $func = $flow;
         if (is_string($flow)) {
-            $func = self::importer($flow, $logger);
+            $extension = strtolower(pathinfo($flow, PATHINFO_EXTENSION));
+            if ($extension === "yml" || $extension === "yaml") {
+                $func = self::flowFromYaml($flow, $options);
+            } else {
+                $func = self::importer($flow, $logger);
+            }
         }
 
         if (!$func || !is_callable($func)) {
@@ -377,7 +585,7 @@ final class runner
         int $targetIndex
     ): void {
         self::traceStep("call", self::callableName($func), $stepId, $stepIdx, $context, $call);
-        $targetBlock = trim($call);
+        $targetBlock = self::extractBlockTarget($call, self::callableName($func));
         if ($targetBlock === "") {
             $targetBlock = self::callableName($func);
         }
@@ -407,7 +615,7 @@ final class runner
         int $targetIndex
     ): void {
         self::traceStep("jump", self::callableName($func), $stepId, $stepIdx, $context, $jump);
-        $targetBlock = trim($jump);
+        $targetBlock = self::extractBlockTarget($jump, self::callableName($func));
         if ($targetBlock === "") {
             $targetBlock = self::callableName($func);
         }
@@ -507,6 +715,380 @@ final class runner
     }
 
     /**
+     * @param string $yamlPath
+     *
+     * @return array<string, mixed>
+     */
+    private static function parseYamlFlowFile(string $yamlPath): array
+    {
+        $path = trim($yamlPath);
+        if ($path === "") {
+            throw new RuntimeException("[divengine.runner] YAML path is empty.");
+        }
+
+        if (!is_file($path)) {
+            throw new RuntimeException("[divengine.runner] YAML flow file not found: {$path}");
+        }
+
+        $contents = file_get_contents($path);
+        if ($contents === false) {
+            throw new RuntimeException("[divengine.runner] YAML flow file could not be read: {$path}");
+        }
+
+        try {
+            $parsed = Yaml::parse($contents);
+        } catch (ParseException $e) {
+            throw new RuntimeException(
+                "[divengine.runner] Invalid YAML in '{$path}': " . $e->getMessage(),
+                0,
+                $e
+            );
+        }
+
+        if (!is_array($parsed)) {
+            throw new RuntimeException(
+                "[divengine.runner] YAML flow root must be a mapping: {$path}"
+            );
+        }
+
+        return $parsed;
+    }
+
+    /**
+     * @param array<string, mixed> $flowDef
+     *
+     * @return array<int, array{id:string,steps:array<int, array<string,mixed>>}>
+     */
+    private static function normalizeFlowBlocks(array $flowDef): array
+    {
+        $blocksRaw = $flowDef["striders"] ?? $flowDef["blocks"] ?? null;
+        if (!is_array($blocksRaw)) {
+            throw new RuntimeException(
+                "[divengine.runner] Invalid YAML flow format: 'striders' or 'blocks' must be defined."
+            );
+        }
+
+        $normalized = [];
+
+        if (array_is_list($blocksRaw)) {
+            foreach ($blocksRaw as $blockData) {
+                if (!is_array($blockData)) {
+                    throw new RuntimeException("[divengine.runner] Invalid block entry in flow list.");
+                }
+
+                $blockId = trim((string) ($blockData["id"] ?? ""));
+                $stepsRaw = $blockData["steps"] ?? [];
+                $steps = self::normalizeFlowSteps($stepsRaw);
+                $normalized[] = [
+                    "id" => $blockId,
+                    "steps" => $steps,
+                ];
+            }
+
+            return $normalized;
+        }
+
+        foreach ($blocksRaw as $blockId => $blockData) {
+            if (!is_array($blockData)) {
+                throw new RuntimeException(
+                    "[divengine.runner] Block '{$blockId}' must be a mapping."
+                );
+            }
+
+            $stepsRaw = $blockData["steps"] ?? [];
+            $steps = self::normalizeFlowSteps($stepsRaw);
+            $normalized[] = [
+                "id" => trim((string) $blockId),
+                "steps" => $steps,
+            ];
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * @param mixed $stepsRaw
+     *
+     * @return array<int, array<string,mixed>>
+     */
+    private static function normalizeFlowSteps(mixed $stepsRaw): array
+    {
+        if (!is_array($stepsRaw)) {
+            throw new RuntimeException("[divengine.runner] Block 'steps' must be a list or mapping.");
+        }
+
+        $normalized = [];
+
+        if (array_is_list($stepsRaw)) {
+            foreach ($stepsRaw as $stepData) {
+                if (!is_array($stepData)) {
+                    throw new RuntimeException("[divengine.runner] Invalid step entry in step list.");
+                }
+
+                $stepId = trim((string) ($stepData["id"] ?? ""));
+                $stepCopy = $stepData;
+                $stepCopy["id"] = $stepId;
+                $normalized[] = $stepCopy;
+            }
+
+            return $normalized;
+        }
+
+        foreach ($stepsRaw as $stepId => $stepData) {
+            if (!is_array($stepData)) {
+                throw new RuntimeException(
+                    "[divengine.runner] Step '{$stepId}' must be a mapping."
+                );
+            }
+
+            $stepCopy = $stepData;
+            $stepCopy["id"] = trim((string) $stepId);
+            $normalized[] = $stepCopy;
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * @param array<int, array{id:string,steps:array<int, array<string,mixed>>}> $blocks
+     */
+    private static function validateFlowBlocks(array $blocks): void
+    {
+        if ($blocks === []) {
+            throw new RuntimeException("[divengine.runner] YAML flow must contain at least one block.");
+        }
+
+        $blockIds = [];
+        foreach ($blocks as $block) {
+            $blockId = $block["id"];
+            if ($blockId === "") {
+                throw new RuntimeException("[divengine.runner] Block id cannot be empty.");
+            }
+            if (str_contains($blockId, ".")) {
+                throw new RuntimeException("[divengine.runner] Block id '{$blockId}' cannot contain a dot.");
+            }
+            if (isset($blockIds[$blockId])) {
+                throw new RuntimeException("[divengine.runner] Duplicate block id '{$blockId}'.");
+            }
+
+            $blockIds[$blockId] = true;
+            $stepIds = [];
+            foreach ($block["steps"] as $step) {
+                $stepId = trim((string) ($step["id"] ?? ""));
+                if ($stepId === "") {
+                    throw new RuntimeException("[divengine.runner] Step id cannot be empty in block '{$blockId}'.");
+                }
+                if (str_contains($stepId, ".")) {
+                    throw new RuntimeException(
+                        "[divengine.runner] Step id '{$stepId}' in block '{$blockId}' cannot contain a dot."
+                    );
+                }
+                if (isset($stepIds[$stepId])) {
+                    throw new RuntimeException(
+                        "[divengine.runner] Duplicate step id '{$stepId}' in block '{$blockId}'."
+                    );
+                }
+                $stepIds[$stepId] = true;
+
+                $callRef = isset($step["call"]) && is_string($step["call"]) ? trim($step["call"]) : "";
+                if ($callRef !== "") {
+                    self::validateReferenceSyntax($callRef, "call");
+                }
+
+                $jumpRef = isset($step["jump"]) && is_string($step["jump"]) ? trim($step["jump"]) : "";
+                if ($jumpRef !== "") {
+                    self::validateReferenceSyntax($jumpRef, "jump");
+                }
+            }
+        }
+    }
+
+    private static function validateReferenceSyntax(string $reference, string $kind): void
+    {
+        if (!str_contains($reference, ".")) {
+            throw new RuntimeException(
+                "[divengine.runner] '{$kind}' reference must contain a dot: {$reference}"
+            );
+        }
+    }
+
+    /**
+     * @param array<int, array{id:string,steps:array<int, array<string,mixed>>}> $blocks
+     *
+     * @return array<int, string>
+     */
+    private static function collectFunctionReferences(array $blocks): array
+    {
+        $references = [];
+        foreach ($blocks as $block) {
+            foreach ($block["steps"] as $step) {
+                $conditionRef = isset($step["condition"]) && is_string($step["condition"])
+                    ? trim($step["condition"])
+                    : "";
+                $activityRef = isset($step["activity"]) && is_string($step["activity"])
+                    ? trim($step["activity"])
+                    : "";
+
+                if ($conditionRef !== "") {
+                    $references[$conditionRef] = true;
+                }
+                if ($activityRef !== "") {
+                    $references[$activityRef] = true;
+                }
+            }
+        }
+
+        return array_keys($references);
+    }
+
+    /**
+     * @param array<int, array{id:string,steps:array<int, array<string,mixed>>}> $blocks
+     *
+     * @return array<string, array<string, int>>
+     */
+    private static function buildStepIndexMap(array $blocks): array
+    {
+        $stepIndexMap = [];
+        foreach ($blocks as $block) {
+            $blockId = $block["id"];
+            $stepIndexMap[$blockId] = [];
+            foreach ($block["steps"] as $index => $step) {
+                $stepIndexMap[$blockId][$step["id"]] = $index;
+            }
+        }
+
+        return $stepIndexMap;
+    }
+
+    private static function resolveFunctionImportPath(string $reference, string $yamlPath, array $options): string
+    {
+        $map = [];
+        if (isset($options["function_map"]) && is_array($options["function_map"])) {
+            $map = $options["function_map"];
+        }
+        if (isset($map[$reference]) && is_string($map[$reference]) && trim($map[$reference]) !== "") {
+            $mappedPath = trim($map[$reference]);
+            if (self::isAbsolutePath($mappedPath)) {
+                return $mappedPath;
+            }
+            return self::joinPath(dirname($yamlPath), $mappedPath);
+        }
+
+        $trimmedReference = trim($reference);
+        if ($trimmedReference === "") {
+            return $trimmedReference;
+        }
+
+        if (self::isAbsolutePath($trimmedReference)) {
+            return $trimmedReference;
+        }
+
+        $functionsPath = isset($options["functions_path"]) && is_string($options["functions_path"])
+            ? trim($options["functions_path"])
+            : "";
+
+        if (
+            $functionsPath !== ""
+            && !str_contains($trimmedReference, "/")
+            && !str_contains($trimmedReference, "\\")
+            && !str_starts_with($trimmedReference, ".")
+        ) {
+            return self::joinPath($functionsPath, $trimmedReference);
+        }
+
+        return self::joinPath(dirname($yamlPath), $trimmedReference);
+    }
+
+    /**
+     * @param array<string, array<string, int>> $stepIndexMap
+     *
+     * @return array{0:string,1:int}
+     */
+    private static function resolveBlockTarget(
+        string $reference,
+        string $currentBlock,
+        array $stepIndexMap,
+        string $kind
+    ): array {
+        [$targetBlock, $targetStep] = self::parseBlockReference($reference);
+
+        if ($targetBlock === "") {
+            $targetBlock = $currentBlock;
+        }
+
+        if (!isset($stepIndexMap[$targetBlock])) {
+            throw new RuntimeException(
+                "[divengine.runner] {$kind} target block '{$targetBlock}' not found."
+            );
+        }
+
+        if ($targetStep === "") {
+            return [$targetBlock, 0];
+        }
+
+        if (!isset($stepIndexMap[$targetBlock][$targetStep])) {
+            throw new RuntimeException(
+                "[divengine.runner] {$kind} target step '{$targetStep}' not found in block '{$targetBlock}'."
+            );
+        }
+
+        return [$targetBlock, $stepIndexMap[$targetBlock][$targetStep]];
+    }
+
+    /**
+     * @return array{0:string,1:string}
+     */
+    private static function parseBlockReference(string $reference): array
+    {
+        $parts = explode(".", $reference, 2);
+        if (count($parts) !== 2) {
+            throw new RuntimeException(
+                "[divengine.runner] Invalid block reference syntax: {$reference}"
+            );
+        }
+
+        return [trim($parts[0]), trim($parts[1])];
+    }
+
+    private static function extractBlockTarget(string $reference, string $fallback): string
+    {
+        $trimmedReference = trim($reference);
+        if ($trimmedReference === "") {
+            return $fallback;
+        }
+
+        if (!str_contains($trimmedReference, ".")) {
+            return $trimmedReference;
+        }
+
+        [$block] = explode(".", $trimmedReference, 2);
+        $block = trim($block);
+        if ($block === "") {
+            return $fallback;
+        }
+
+        return $block;
+    }
+
+    private static function isAbsolutePath(string $path): bool
+    {
+        return str_starts_with($path, "/")
+            || preg_match('/^[A-Za-z]:[\\\\\\/]/', $path) === 1
+            || preg_match('/^[\\\\\\/]{2}/', $path) === 1;
+    }
+
+    private static function joinPath(string $basePath, string $relativePath): string
+    {
+        $base = rtrim($basePath, "\\/");
+        $relative = ltrim($relativePath, "\\/");
+        if ($base === "") {
+            return $relative;
+        }
+
+        return $base . DIRECTORY_SEPARATOR . $relative;
+    }
+
+    /**
      * Validates flow callable signature requirements.
      *
      * @param callable $func
@@ -540,7 +1122,7 @@ final class runner
         }
 
         $type = $param->getType();
-        if ($type instanceof \ReflectionNamedType && $type->getName() !== "array") {
+        if ($type instanceof ReflectionNamedType && $type->getName() !== "array") {
             throw new RuntimeException(
                 "[divengine.runner] Flow function 'context' parameter type must be array when declared."
             );

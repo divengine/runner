@@ -174,11 +174,23 @@ final class RunnerTest extends TestCase
         $this->assertTrue((bool) ($context["imported_flow_executed"] ?? false));
     }
 
+    public function testGenerateFlowCodeFromYamlReturnsExecutableClosure(): void
+    {
+        $yamlPath = __DIR__ . DIRECTORY_SEPARATOR . "flows" . DIRECTORY_SEPARATOR . "business_flow.yml";
+
+        $generatedCode = runner::generateFlowCodeFromYaml($yamlPath);
+        $this->assertStringContainsString('return function (array &$context): void {', $generatedCode);
+        $this->assertStringContainsString("jump_if_audit_enabled", $generatedCode);
+
+        $flowCallable = runner::flowFromYaml($yamlPath);
+        $this->assertIsCallable($flowCallable);
+    }
+
     public function testRunBusinessFixtureFlowUsesActivitiesAndBlocks(): void
     {
         $tempDir = $this->createTempProject();
         $targetFile = $tempDir . DIRECTORY_SEPARATOR . "business-output.txt";
-        $flowPath = __DIR__ . DIRECTORY_SEPARATOR . "flows" . DIRECTORY_SEPARATOR . "business_flow.php";
+        $flowPath = __DIR__ . DIRECTORY_SEPARATOR . "flows" . DIRECTORY_SEPARATOR . "business_flow.yml";
 
         $context = [
             "left" => 8,
@@ -207,7 +219,7 @@ final class RunnerTest extends TestCase
 
     public function testRunPauseResumeFixtureFlowResumesFromSavedStep(): void
     {
-        $flowPath = __DIR__ . DIRECTORY_SEPARATOR . "flows" . DIRECTORY_SEPARATOR . "pause_resume_flow.php";
+        $flowPath = __DIR__ . DIRECTORY_SEPARATOR . "flows" . DIRECTORY_SEPARATOR . "pause_resume_flow.yml";
         $context = [
             "left" => 10,
             "right" => 2,
@@ -227,7 +239,32 @@ final class RunnerTest extends TestCase
         $this->assertSame(12, $context["sum"] ?? null);
         $this->assertSame("HOLD ME", $context["upper_text"] ?? null);
         $this->assertSame("resume_done", $context["flow_result"] ?? null);
-        $this->assertSame([], $context["_flow_state"] ?? null);
+        $this->assertSame(-1, $context["_flow_state"]["step_index"] ?? -1);
+        $this->assertNull($context["_flow_state"]["block"] ?? null);
+    }
+
+    public function testRunYamlExecutesFlowDirectly(): void
+    {
+        $tempDir = $this->createTempProject();
+        $targetFile = $tempDir . DIRECTORY_SEPARATOR . "business-output-runyaml.txt";
+        $flowPath = __DIR__ . DIRECTORY_SEPARATOR . "flows" . DIRECTORY_SEPARATOR . "business_flow.yml";
+
+        $context = [
+            "left" => 3,
+            "right" => 4,
+            "text" => "yaml mode",
+            "customer_name" => "rafageist",
+            "enable_audit" => false,
+            "target_file" => $targetFile,
+        ];
+
+        runner::runYaml($flowPath, $context);
+
+        $this->assertSame("done", $context["_runner_state"] ?? null);
+        $this->assertSame(7, $context["sum"] ?? null);
+        $this->assertSame("YAML MODE", $context["upper_text"] ?? null);
+        $this->assertSame("business_done", $context["flow_result"] ?? null);
+        $this->assertFileExists($targetFile);
     }
 
     public function testFlowLoopHandlesJumpTokenAndContinuesWithSavedBlock(): void

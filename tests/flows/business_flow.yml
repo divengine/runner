@@ -1,0 +1,47 @@
+id: business-flow
+description: Business flow fixture in YAML format
+striders:
+  main:
+    steps:
+      sum_step:
+        activity: ../activities/add_values.php
+
+      prepare_line:
+        activity: ../activities/build_file_line.php
+
+      jump_if_audit_enabled:
+        condition: ../activities/is_audit_enabled.php
+        jump: audit.audit_stamp
+
+      go_finalize:
+        jump: finalize.set_read_key
+
+  audit:
+    steps:
+      audit_stamp:
+        activity: ../activities/stamp_now_iso.php
+
+      add_audit_line:
+        activity: ../activities/append_audit_to_file_line.php
+
+      go_finalize:
+        jump: finalize.set_read_key
+
+  finalize:
+    steps:
+      set_read_key:
+        context:
+          read_key: sum
+
+      read_sum:
+        activity: ../activities/read_context_value.php
+
+      normalize_text:
+        activity: ../activities/uppercase_text.php
+
+      write_result:
+        activity: ../activities/write_file_line.php
+
+      set_flow_result:
+        context:
+          flow_result: business_done

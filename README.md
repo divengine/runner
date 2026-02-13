@@ -32,6 +32,17 @@ runner::run($flow, $context);
 echo $context["greeting"]; // Hello World
 ```
 
+## YAML Usage
+
+```php
+use divengine\runner\runner;
+
+$context = [];
+runner::run(__DIR__ . "/flows/sample.yml", $context);
+```
+
+`runner::run()` auto-compiles `.yml`/`.yaml` files to callable flows, and you can also use `runner::runYaml()` explicitly.
+
 ## Documentation
 
 See `docs/README.md` for extended notes on context keys and helpers.
