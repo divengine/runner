@@ -302,6 +302,43 @@ YAML;
         $this->assertSame("CONTEXT ROOT", $context["upper_text"] ?? null);
     }
 
+    public function testRunYamlSupportsListBlocksAndStepsSyntax(): void
+    {
+        $tempDir = $this->createTempProject();
+        $yamlPath = $tempDir . DIRECTORY_SEPARATOR . "flow-list-syntax.yml";
+
+        $yaml = <<<YAML
+id: list-style-flow
+description: list based block and step syntax
+blocks:
+  - id: main
+    steps:
+      - id: sum_step
+        activity: add_values
+      - id: normalize_text
+        activity: uppercase_text
+      - id: end
+        context:
+          flow_result: list_done
+YAML;
+
+        file_put_contents($yamlPath, $yaml);
+
+        $context = [
+            "left" => 2,
+            "right" => 6,
+            "text" => "list syntax",
+            "_root_folder" => __DIR__ . DIRECTORY_SEPARATOR . "activities",
+        ];
+
+        runner::run($yamlPath, $context);
+
+        $this->assertSame("done", $context["_runner_state"] ?? null);
+        $this->assertSame(8, $context["sum"] ?? null);
+        $this->assertSame("LIST SYNTAX", $context["upper_text"] ?? null);
+        $this->assertSame("list_done", $context["flow_result"] ?? null);
+    }
+
     public function testFlowLoopHandlesJumpTokenAndContinuesWithSavedBlock(): void
     {
         $context = [];

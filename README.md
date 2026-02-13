@@ -44,6 +44,7 @@ runner::run(__DIR__ . "/flows/sample.yml", $context);
 `runner::run()` auto-compiles `.yml`/`.yaml` files to callable flows, and you can also use `runner::runYaml()` explicitly.
 
 In YAML flows, `activity`/`condition` names can omit `.php`. Function lookup uses `_root_folder` in context first, then `DIV_RUNNER_ROOT_FOLDER` (default `./`) at import time. If no file is found, importer also accepts callable identifiers (e.g. `strlen` or namespaced functions loaded by Composer).
+YAML parsing for flow definitions is built into runner (no third-party runtime parser dependency).
 
 ## Documentation
 

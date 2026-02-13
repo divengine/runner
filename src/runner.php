@@ -21,8 +21,6 @@ use ReflectionFunctionAbstract;
 use ReflectionMethod;
 use ReflectionNamedType;
 use RuntimeException;
-use Symfony\Component\Yaml\Exception\ParseException;
-use Symfony\Component\Yaml\Yaml;
 use Throwable;
 
 defined('DIV_RUNNER_ROOT_FOLDER') or define('DIV_RUNNER_ROOT_FOLDER', './');
@@ -751,23 +749,385 @@ final class runner
             throw new RuntimeException("[divengine.runner] YAML flow file could not be read: {$path}");
         }
 
-        try {
-            $parsed = Yaml::parse($contents);
-        } catch (ParseException $e) {
+        $lines = self::tokenizeYaml($contents, $path);
+        if ($lines === []) {
             throw new RuntimeException(
-                "[divengine.runner] Invalid YAML in '{$path}': " . $e->getMessage(),
-                0,
-                $e
+                "[divengine.runner] YAML flow root must be a mapping: {$path}"
             );
         }
 
-        if (!is_array($parsed)) {
+        $index = 0;
+        $parsed = self::parseYamlNode($lines, $index, $lines[0]["indent"]);
+        if ($index !== count($lines)) {
+            $line = $lines[$index]["line"];
+            throw new RuntimeException(
+                "[divengine.runner] Invalid YAML in '{$path}' near line {$line}: unexpected trailing content."
+            );
+        }
+
+        if (!is_array($parsed) || array_is_list($parsed)) {
             throw new RuntimeException(
                 "[divengine.runner] YAML flow root must be a mapping: {$path}"
             );
         }
 
         return $parsed;
+    }
+
+    /**
+     * Converts YAML text into indentation-aware logical lines.
+     *
+     * @param string $contents
+     * @param string $yamlPath
+     *
+     * @return array<int, array{indent:int,content:string,line:int}>
+     */
+    private static function tokenizeYaml(string $contents, string $yamlPath): array
+    {
+        $rawLines = preg_split('/\r\n|\n|\r/', $contents);
+        if (!is_array($rawLines)) {
+            return [];
+        }
+
+        $lines = [];
+        foreach ($rawLines as $lineNumber => $rawLine) {
+            if (!is_string($rawLine)) {
+                continue;
+            }
+
+            if ($lineNumber === 0 && str_starts_with($rawLine, "\xEF\xBB\xBF")) {
+                $rawLine = substr($rawLine, 3);
+            }
+
+            if (str_contains($rawLine, "\t")) {
+                $line = $lineNumber + 1;
+                throw new RuntimeException(
+                    "[divengine.runner] Invalid YAML in '{$yamlPath}' line {$line}: tabs are not supported for indentation."
+                );
+            }
+
+            $withoutComments = self::stripYamlComments($rawLine);
+            $trimmed = trim($withoutComments);
+            if ($trimmed === "" || $trimmed === "---" || $trimmed === "...") {
+                continue;
+            }
+
+            preg_match('/^( *)/', $withoutComments, $matches);
+            $indent = isset($matches[1]) ? strlen($matches[1]) : 0;
+            $lines[] = [
+                "indent" => $indent,
+                "content" => ltrim($withoutComments),
+                "line" => $lineNumber + 1,
+            ];
+        }
+
+        return $lines;
+    }
+
+    private static function stripYamlComments(string $line): string
+    {
+        $length = strlen($line);
+        $quote = null;
+        $escaped = false;
+
+        for ($i = 0; $i < $length; $i++) {
+            $char = $line[$i];
+
+            if ($quote === '"') {
+                if ($escaped) {
+                    $escaped = false;
+                    continue;
+                }
+
+                if ($char === "\\") {
+                    $escaped = true;
+                    continue;
+                }
+
+                if ($char === '"') {
+                    $quote = null;
+                }
+                continue;
+            }
+
+            if ($quote === "'") {
+                if ($char === "'") {
+                    $quote = null;
+                }
+                continue;
+            }
+
+            if ($char === '"' || $char === "'") {
+                $quote = $char;
+                continue;
+            }
+
+            if ($char === "#") {
+                return rtrim(substr($line, 0, $i));
+            }
+        }
+
+        return $line;
+    }
+
+    /**
+     * @param array<int, array{indent:int,content:string,line:int}> $lines
+     * @param int                                                    $index
+     * @param int                                                    $indent
+     *
+     * @return mixed
+     */
+    private static function parseYamlNode(array $lines, int &$index, int $indent): mixed
+    {
+        if (!isset($lines[$index])) {
+            return null;
+        }
+
+        $entry = $lines[$index];
+        if ($entry["indent"] < $indent) {
+            return null;
+        }
+
+        if ($entry["indent"] !== $indent) {
+            throw new RuntimeException(
+                "[divengine.runner] Invalid YAML indentation at line {$entry["line"]}."
+            );
+        }
+
+        if (str_starts_with($entry["content"], "-")) {
+            return self::parseYamlSequence($lines, $index, $indent);
+        }
+
+        return self::parseYamlMapping($lines, $index, $indent);
+    }
+
+    /**
+     * @param array<int, array{indent:int,content:string,line:int}> $lines
+     * @param int                                                    $index
+     * @param int                                                    $indent
+     *
+     * @return array<string, mixed>
+     */
+    private static function parseYamlMapping(array $lines, int &$index, int $indent): array
+    {
+        $result = [];
+
+        while (isset($lines[$index])) {
+            $entry = $lines[$index];
+            if ($entry["indent"] < $indent) {
+                break;
+            }
+
+            if ($entry["indent"] > $indent) {
+                throw new RuntimeException(
+                    "[divengine.runner] Invalid YAML indentation at line {$entry["line"]}."
+                );
+            }
+
+            if (str_starts_with($entry["content"], "-")) {
+                throw new RuntimeException(
+                    "[divengine.runner] Invalid YAML in line {$entry["line"]}: sequence item found where mapping is expected."
+                );
+            }
+
+            [$key, $valuePart] = self::splitYamlKeyValue($entry["content"], $entry["line"]);
+            if (array_key_exists($key, $result)) {
+                throw new RuntimeException(
+                    "[divengine.runner] Duplicate YAML key '{$key}' at line {$entry["line"]}."
+                );
+            }
+
+            $index++;
+            if ($valuePart !== "") {
+                $result[$key] = self::parseYamlScalar($valuePart);
+                continue;
+            }
+
+            if (!isset($lines[$index]) || $lines[$index]["indent"] <= $indent) {
+                $result[$key] = null;
+                continue;
+            }
+
+            $result[$key] = self::parseYamlNode($lines, $index, $lines[$index]["indent"]);
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param array<int, array{indent:int,content:string,line:int}> $lines
+     * @param int                                                    $index
+     * @param int                                                    $indent
+     *
+     * @return array<int, mixed>
+     */
+    private static function parseYamlSequence(array $lines, int &$index, int $indent): array
+    {
+        $result = [];
+
+        while (isset($lines[$index])) {
+            $entry = $lines[$index];
+            if ($entry["indent"] < $indent) {
+                break;
+            }
+
+            if ($entry["indent"] > $indent) {
+                throw new RuntimeException(
+                    "[divengine.runner] Invalid YAML indentation at line {$entry["line"]}."
+                );
+            }
+
+            if (!str_starts_with($entry["content"], "-")) {
+                throw new RuntimeException(
+                    "[divengine.runner] Invalid YAML in line {$entry["line"]}: mapping found where sequence item is expected."
+                );
+            }
+
+            $itemLine = ltrim(substr($entry["content"], 1));
+            $index++;
+
+            if ($itemLine === "") {
+                if (isset($lines[$index]) && $lines[$index]["indent"] > $indent) {
+                    $result[] = self::parseYamlNode($lines, $index, $lines[$index]["indent"]);
+                } else {
+                    $result[] = null;
+                }
+                continue;
+            }
+
+            $firstColon = strpos($itemLine, ":");
+            if ($firstColon !== false) {
+                $item = [];
+                [$key, $valuePart] = self::splitYamlKeyValue($itemLine, $entry["line"]);
+                if ($valuePart !== "") {
+                    $item[$key] = self::parseYamlScalar($valuePart);
+                } elseif (isset($lines[$index]) && $lines[$index]["indent"] > $indent) {
+                    $item[$key] = self::parseYamlNode($lines, $index, $lines[$index]["indent"]);
+                } else {
+                    $item[$key] = null;
+                }
+
+                if (isset($lines[$index]) && $lines[$index]["indent"] > $indent) {
+                    $extra = self::parseYamlMapping($lines, $index, $lines[$index]["indent"]);
+                    foreach ($extra as $extraKey => $extraValue) {
+                        if (array_key_exists($extraKey, $item)) {
+                            $line = $entry["line"];
+                            throw new RuntimeException(
+                                "[divengine.runner] Duplicate YAML key '{$extraKey}' in sequence item near line {$line}."
+                            );
+                        }
+                        $item[$extraKey] = $extraValue;
+                    }
+                }
+
+                $result[] = $item;
+                continue;
+            }
+
+            $result[] = self::parseYamlScalar($itemLine);
+        }
+
+        return $result;
+    }
+
+    /**
+     * @return array{0:string,1:string}
+     */
+    private static function splitYamlKeyValue(string $line, int $lineNumber): array
+    {
+        $length = strlen($line);
+        $quote = null;
+        $escaped = false;
+
+        for ($i = 0; $i < $length; $i++) {
+            $char = $line[$i];
+
+            if ($quote === '"') {
+                if ($escaped) {
+                    $escaped = false;
+                    continue;
+                }
+                if ($char === "\\") {
+                    $escaped = true;
+                    continue;
+                }
+                if ($char === '"') {
+                    $quote = null;
+                }
+                continue;
+            }
+
+            if ($quote === "'") {
+                if ($char === "'") {
+                    $quote = null;
+                }
+                continue;
+            }
+
+            if ($char === '"' || $char === "'") {
+                $quote = $char;
+                continue;
+            }
+
+            if ($char !== ":") {
+                continue;
+            }
+
+            $key = trim(substr($line, 0, $i));
+            if ($key === "") {
+                throw new RuntimeException(
+                    "[divengine.runner] Invalid YAML in line {$lineNumber}: empty mapping key."
+                );
+            }
+
+            $value = trim(substr($line, $i + 1));
+            return [$key, $value];
+        }
+
+        throw new RuntimeException(
+            "[divengine.runner] Invalid YAML in line {$lineNumber}: expected 'key: value'."
+        );
+    }
+
+    private static function parseYamlScalar(string $value): mixed
+    {
+        $trimmed = trim($value);
+        if ($trimmed === "") {
+            return "";
+        }
+
+        if (
+            (str_starts_with($trimmed, '"') && str_ends_with($trimmed, '"'))
+            || (str_starts_with($trimmed, "'") && str_ends_with($trimmed, "'"))
+        ) {
+            $unquoted = substr($trimmed, 1, -1);
+            if (str_starts_with($trimmed, '"')) {
+                $decoded = stripcslashes($unquoted);
+                return $decoded;
+            }
+            return str_replace("''", "'", $unquoted);
+        }
+
+        $lower = strtolower($trimmed);
+        if ($lower === "true") {
+            return true;
+        }
+        if ($lower === "false") {
+            return false;
+        }
+        if ($lower === "null" || $trimmed === "~") {
+            return null;
+        }
+
+        if (preg_match('/^-?[0-9]+$/', $trimmed) === 1) {
+            return (int) $trimmed;
+        }
+
+        if (preg_match('/^-?[0-9]+\\.[0-9]+$/', $trimmed) === 1) {
+            return (float) $trimmed;
+        }
+
+        return $trimmed;
     }
 
     /**

@@ -82,6 +82,7 @@ Flow format notes:
 - `activity` and `condition` values can omit `.php` extension.
 - `call` and `jump` references use `block.step` syntax.
 - `activity` and `condition` are imported as PHP callables through the standard importer.
+- YAML parsing is handled internally by runner for flow DSL inputs (no external YAML package at runtime).
 
 Function root precedence during YAML execution:
 
