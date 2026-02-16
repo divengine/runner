@@ -49,6 +49,7 @@ YAML parsing for flow definitions is built into runner (no third-party runtime p
 ## Documentation
 
 See `docs/README.md` for extended notes on context keys and helpers.
+Reserved context key reference: `docs/context-keys.md`.
 
 ## Performance Benchmarks
 

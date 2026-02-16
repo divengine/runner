@@ -30,14 +30,18 @@ echo $context["greeting"]; // Hello World
 
 ## Context Keys
 
-After execution, the runner stores metadata in the shared context:
+The canonical reserved-key reference is maintained in:
 
-- `_runner_state`: processing | done | paused | error
-- `_runner_result`: summary message
-- `_runner_error`: full error details (if any)
-- `_runner_logs`: structured log entries
-- `_runner_started_at`: ISO-8601 start time
-- `_runner_ended_at`: ISO-8601 end time
+- `docs/context-keys.md`
+
+Common runtime metadata includes:
+
+- `_runner_state`
+- `_runner_result`
+- `_runner_error`
+- `_runner_logs`
+- `_runner_started_at`
+- `_runner_ended_at`
 
 ## Flow Helpers
 
