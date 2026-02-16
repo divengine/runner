@@ -38,6 +38,7 @@
   },
   "scripts": {
     "bench": "vendor/bin/phpbench run --report=aggregate --progress=none",
+    "docs:pdf": "python scripts/build_pdf.py --output runner-documentation.pdf",
     "test": "vendor/bin/phpunit --colors=always",
     "phpstan": "vendor/bin/phpstan analyse -c phpstan.neon --no-progress --memory-limit=1G"
   }

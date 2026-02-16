@@ -50,6 +50,13 @@ YAML parsing for flow definitions is built into runner (no third-party runtime p
 
 See `docs/README.md` for extended notes on context keys and helpers.
 Reserved context key reference: `docs/context-keys.md`.
+Book chapters: `docs/book/` with order in `docs/book-order.txt`.
+
+Build the documentation PDF locally:
+
+```bash
+composer docs:pdf
+```
 
 ## Performance Benchmarks
 

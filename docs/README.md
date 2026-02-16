@@ -1,5 +1,24 @@
 # Divengine Runner Documentation
 
+## Book
+
+Book chapters and order file:
+
+- chapters: `docs/book/`
+- order file: `docs/book-order.txt`
+
+Generate book markdown:
+
+```bash
+python scripts/build_pdf.py --markdown-only --no-mermaid
+```
+
+Generate book PDF (requires Mermaid CLI + Pandoc + XeLaTeX):
+
+```bash
+python scripts/build_pdf.py --output runner-documentation.pdf
+```
+
 ## Overview
 
 Divengine Runner is a lightweight execution engine for PHP jobs and flows. A job is just a PHP function that receives a shared associative context array. The runner injects helpers into the context and tracks execution state, logs, and timing.
