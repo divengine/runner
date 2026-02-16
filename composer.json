@@ -1,0 +1,45 @@
+{
+  "name": "divengine/runner",
+  "license": "GPL-3.0-or-later",
+  "description": "Divengine job runner for PHP flows.",
+  "keywords": [
+    "runner",
+    "jobs",
+    "workflow",
+    "divengine"
+  ],
+  "homepage": "https://divengine.com",
+  "version": "0.1.0",
+  "authors": [
+    {
+      "name": "Rafa Rodriguez",
+      "email": "rafageist@divengine.com",
+      "homepage": "https://rafageist.com",
+      "role": "Founder"
+    }
+  ],
+  "require": {
+    "php": ">=8.0.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "divengine\\runner\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "divengine\\runner\\Tests\\": "tests/"
+    }
+  },
+  "require-dev": {
+    "phpbench/phpbench": "^1.3",
+    "phpstan/phpstan": "^1.10",
+    "phpunit/phpunit": "^10.5"
+  },
+  "scripts": {
+    "bench": "vendor/bin/phpbench run --report=aggregate --progress=none",
+    "docs:pdf": "python scripts/build_pdf.py --output runner-documentation.pdf",
+    "test": "vendor/bin/phpunit --colors=always",
+    "phpstan": "vendor/bin/phpstan analyse -c phpstan.neon --no-progress --memory-limit=1G"
+  }
+}

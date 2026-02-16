@@ -1,0 +1,13 @@
+# Runner Book Order
+# Paths are repository-relative.
+
+docs/book/00-cover.md
+docs/book/01-introduction.md
+docs/book/02-architecture.md
+docs/book/03-flow-block-step-model.md
+docs/book/04-importer-and-resolution.md
+docs/book/05-yaml-flow-dsl.md
+docs/book/06-context-contract.md
+docs/context-keys.md
+docs/book/07-quality-and-ci.md
+docs/book/08-appendix-examples.md
