@@ -1,4 +1,5 @@
 <?php
+
 declare(strict_types=1);
 
 /**
@@ -1471,26 +1472,21 @@ final class runner
 
         $param = $ref->getParameters()[0];
 
-        if ($requireContextParamName) {
-            if ($param->getName() !== "context") {
-                throw new RuntimeException(
-                    "[divengine.runner] Flow function first parameter must be named 'context'."
-                );
-            }
-        }
+        if ($requireContextParamName && $param->getName() !== "context") 
+            throw new RuntimeException(
+                "[divengine.runner] Flow function first parameter must be named 'context'."
+            );
 
-        if (!$param->isPassedByReference()) {
+        if (!$param->isPassedByReference())
             throw new RuntimeException(
                 "[divengine.runner] Flow function must pass 'context' by reference as the first parameter."
             );
-        }
 
         $type = $param->getType();
-        if ($type instanceof ReflectionNamedType && $type->getName() !== "array") {
+        if ($type instanceof ReflectionNamedType && $type->getName() !== "array")
             throw new RuntimeException(
                 "[divengine.runner] Flow function 'context' parameter type must be array when declared."
             );
-        }
     }
 
     /**
