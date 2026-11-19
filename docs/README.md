@@ -19,6 +19,12 @@ Generate book PDF (requires Mermaid CLI + Pandoc + XeLaTeX):
 python scripts/build_pdf.py --output runner-documentation.pdf
 ```
 
+## Further reading
+
+- `docs/sfm-compatibility.md`: compatibility matrix with the SFM runtime
+- `docs/security.md`: trust boundary (`eval()`, imports)
+- `docs/context-keys.md`: reserved context keys
+
 ## Overview
 
 Divengine Runner is a lightweight execution engine for PHP jobs and flows. A job is just a PHP function that receives a shared associative context array. The runner injects helpers into the context and tracks execution state, logs, and timing.
@@ -70,7 +76,7 @@ The runner injects helpers into the context for flow control:
 - `_check_pause`, `_resume_after_call`, `_update_context`
 - `__flow_loop` for block-style execution
 
-These helpers mirror the logic in the original Python runner.
+These helpers mirror the `vvm_strider_jobs` Python runtime; see `docs/sfm-compatibility.md`.
 
 ## YAML Flows
 
@@ -103,6 +109,7 @@ Flow format notes:
 
 - Root uses `blocks` as the container of flow blocks.
 - `activity` and `condition` values can omit `.php` extension.
+- Allowed keys: flow `id`, `description`, `blocks`; block `description`, `steps`; step `description`, `condition`, `context`, `call`, `activity`, `jump`, `pause` (plus `id` in list syntax). Anything else is a compile error.
 - `call` and `jump` references use `block.step` syntax.
 - `activity` and `condition` are imported as PHP callables through the standard importer.
 
@@ -113,7 +120,7 @@ Control-flow semantics (aligned with the `vvm_strider_jobs` runtime):
 - `jump` transfers control without returning. The nearest invocation running the target block restarts at the target step; otherwise the target block becomes the running block and pending call continuations are dropped.
 - Blocks do not fall through: the flow ends when the running block returns.
 - `pause` stores the position in `_flow_state`; running the flow again with the same context resumes after the paused step. Pending call return frames are kept in `_flow_stack`, so a pause inside a called block resumes back into its caller. This differs from `vvm_strider_jobs`, where call continuations are not persisted and a resume inside a called block ends the flow when that block returns.
-- YAML parsing is handled internally by runner for flow DSL inputs (no external YAML package at runtime).
+- YAML parsing is handled internally by runner for flow DSL inputs (no external YAML package at runtime). Supported: block mappings and sequences, plain/quoted scalars, block scalars (`|`, `>`, `-`/`+` chomping), one-line flow collections (`[a, b]`, `{k: v}`), comments. Anchors, aliases, tags and multi-line flow collections are rejected.
 
 Function root precedence during YAML execution:
 

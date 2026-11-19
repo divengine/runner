@@ -9,5 +9,7 @@ docs/book/04-importer-and-resolution.md
 docs/book/05-yaml-flow-dsl.md
 docs/book/06-context-contract.md
 docs/context-keys.md
+docs/sfm-compatibility.md
+docs/security.md
 docs/book/07-quality-and-ci.md
 docs/book/08-appendix-examples.md

@@ -4,11 +4,12 @@
 
 Importer receives a reference and resolves it in this order:
 
-1. If reference is already callable, return it.
-2. Build candidate file paths using runtime root rules.
-3. Require the first existing file that returns a callable.
-4. If no file resolved, retry callable lookup by identifier.
-5. If unresolved, return `null` and emit error log.
+1. Build candidate file paths using runtime root rules (`.php` is appended when missing).
+2. Require the first existing file; it must return a callable.
+3. If no file resolved, accept the reference as a callable identifier (`strlen`, `vendor\\pkg\\fn`).
+4. If unresolved, return `null` and emit an error log.
+
+A file therefore wins over a same-named PHP function.
 
 ## Runtime Root Rules
 

@@ -13,11 +13,15 @@ Runner reserves keys prefixed with `_` or `__` for runtime mechanics.
 
 ## Resume and Pause
 
-Pause behavior stores continuation state in `_flow_state`. On next run:
+Pause behavior stores continuation state in `_flow_state` (and pending call return frames in `_flow_stack`). On next run:
 
 - runner reuses persisted state
 - `_check_pause` skips already executed steps
-- execution continues from stored block and index
+- execution continues after the paused step, then returns through pending calls
+
+An activity can pause the flow by throwing an exception whose message contains `$context["_exception_pause"]`; its result is then not stored. Inside a flow used as an activity, a pause ends only that nested flow.
+
+Runner does not persist anything itself: store the context (data only) and pass it back to `runner::run()`.
 
 ## Error Classification
 

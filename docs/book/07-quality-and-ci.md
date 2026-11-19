@@ -4,7 +4,14 @@
 
 - Unit tests: `vendor/bin/phpunit`
 - Static analysis: `vendor/bin/phpstan analyse -c phpstan.neon --no-progress --memory-limit=1G`
+- Installation smoke test: `composer smoke` (installs the `git archive` dist in a clean project and runs `examples/order`)
 - Optional benchmark suite: `composer bench`
+
+CI runs Composer validation, PHP syntax checks, PHPUnit and the smoke test on PHP 8.1 to 8.5, and PHPStan on PHP 8.1.
+
+## Releases
+
+A release is created only by pushing a `vMAJOR.MINOR.PATCH` tag that points to a commit on `main`. The release workflow checks the tag, the release notes (`releases/<tag>.md`), that `composer.json` has no `version` field and that the release does not exist yet; it reruns tests and static analysis on the tagged revision and then publishes the GitHub release. Packagist reads versions from tags.
 
 ## Documentation Build Workflow
 
