@@ -591,7 +591,9 @@ YAML;
 
     public function testWrapJumpSetsStateAndThrowsJumpToken(): void
     {
+        /** @var array<string, mixed> $context */
         $context = [];
+        $caught = null;
 
         try {
             runner::wrapJump(
@@ -603,11 +605,13 @@ YAML;
                 "go",
                 11
             );
-            $this->fail("wrapJump must throw");
         } catch (\RuntimeException $e) {
-            $this->assertStringContainsString("Jump to go", $e->getMessage());
-            $this->assertStringContainsString($context["_exception_jump_token"], $e->getMessage());
+            $caught = $e;
         }
+
+        $this->assertNotNull($caught, "wrapJump must throw");
+        $this->assertStringContainsString("Jump to go", $caught->getMessage());
+        $this->assertStringContainsString($context["_exception_jump_token"], $caught->getMessage());
 
         $this->assertSame("go", $context["_flow_state"]["block"] ?? null);
         $this->assertSame(11, $context["_flow_state"]["step_index"] ?? null);
@@ -615,15 +619,19 @@ YAML;
 
     public function testWrapPauseSetsStateAndThrowsPauseToken(): void
     {
+        /** @var array<string, mixed> $context */
         $context = [];
+        $caught = null;
 
         try {
             runner::wrapPause("blockX", "pause_step", 12, $context);
-            $this->fail("wrapPause must throw");
         } catch (\RuntimeException $e) {
-            $this->assertStringContainsString("Pause at blockX.pause_step[12]", $e->getMessage());
-            $this->assertStringContainsString($context["_exception_pause_token"], $e->getMessage());
+            $caught = $e;
         }
+
+        $this->assertNotNull($caught, "wrapPause must throw");
+        $this->assertStringContainsString("Pause at blockX.pause_step[12]", $caught->getMessage());
+        $this->assertStringContainsString($context["_exception_pause_token"], $caught->getMessage());
 
         $this->assertSame("blockX", $context["_flow_state"]["block"] ?? null);
         $this->assertSame(12, $context["_flow_state"]["step_index"] ?? null);
@@ -921,32 +929,221 @@ YAML;
         $this->assertSame(["a3", "after"], $context["trace"]);
     }
 
+    public function testActivityPauseCheckpointsItsStepWithoutStoringResult(): void
+    {
+        $yaml = <<<YAML
+blocks:
+  main:
+    steps:
+      s1:
+        activity: mark
+      s2:
+        activity: ask_pause
+      s3:
+        activity: mark
+YAML;
+
+        $context = $this->runTraceFlow($yaml, null, [
+            "ask_pause" => "if (empty(\$context['asked'])) { \$context['asked'] = true; "
+                . "throw new \\RuntimeException(\$context['_exception_pause'] . ' wait'); } return 'ok';",
+        ]);
+        $this->assertSame("paused", $context["_runner_state"]);
+        $this->assertSame(["block" => "main", "step_index" => 2], $context["_flow_state"]);
+        $this->assertArrayNotHasKey("s2", $context);
+
+        $context = $this->runTraceFlow($yaml, $context);
+        $this->assertSame("done", $context["_runner_state"]);
+        // Resume continues after the paused step.
+        $this->assertSame(["s1", "s3"], $context["trace"]);
+        $this->assertArrayNotHasKey("s2", $context);
+    }
+
+    public function testNestedFlowActivityRestoresParentBlocks(): void
+    {
+        $child = <<<YAML
+blocks:
+  main:
+    steps:
+      c1:
+        activity: mark
+      c2:
+        jump: tail.t1
+  tail:
+    steps:
+      t1:
+        activity: mark
+YAML;
+
+        $context = $this->runTraceFlow(<<<YAML
+blocks:
+  main:
+    steps:
+      s1:
+        activity: child_flow
+      s2:
+        jump: main.s4
+      s3:
+        activity: mark
+      s4:
+        activity: mark
+YAML, null, [], ["child_flow" => $child]);
+
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame(["c1", "t1", "s4"], $context["trace"]);
+        $this->assertArrayNotHasKey("_tail", $context);
+        $this->assertSame(0, $context["_flow_depth"]);
+    }
+
+    public function testPauseInsideNestedFlowIsAnEarlyReturn(): void
+    {
+        $child = <<<YAML
+blocks:
+  main:
+    steps:
+      c1:
+        pause: true
+      c2:
+        activity: mark
+YAML;
+
+        $context = $this->runTraceFlow(<<<YAML
+blocks:
+  main:
+    steps:
+      s1:
+        activity: child_flow
+      s2:
+        activity: mark
+YAML, null, [], ["child_flow" => $child]);
+
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame(["s2"], $context["trace"]);
+        $this->assertArrayHasKey("s1", $context);
+        $this->assertNull($context["s1"]);
+        $this->assertArrayNotHasKey("_nested_flow_paused", $context);
+    }
+
+    public function testRecursiveCallStopsAtMaxCallDepth(): void
+    {
+        $projectContext = $this->runTraceFlow(<<<YAML
+blocks:
+  main:
+    steps:
+      again:
+        call: main.again
+YAML, ["trace" => [], "_max_call_depth" => 5]);
+
+        $this->assertSame("error", $projectContext["_runner_state"]);
+        $this->assertStringContainsString("Call depth exceeds 5", $projectContext["_runner_result"]);
+    }
+
+    public function testMissingActivityMarksErrorState(): void
+    {
+        $context = $this->runTraceFlow(<<<YAML
+blocks:
+  main:
+    steps:
+      s1:
+        activity: does_not_exist
+YAML);
+
+        $this->assertSame("error", $context["_runner_state"]);
+        $this->assertStringContainsString("Function import failed: does_not_exist", $context["_runner_result"]);
+        $logs = implode("\n", array_column($context["_runner_logs"], "message"));
+        $this->assertStringContainsString("Import target not found or not callable: does_not_exist", $logs);
+    }
+
+    public function testSchemaRejectsUnknownKeysAndWrongTypes(): void
+    {
+        $projectDir = $this->createTempProject();
+        $yamlPath = $projectDir . DIRECTORY_SEPARATOR . "bad.yml";
+        file_put_contents($yamlPath, <<<YAML
+id: bad
+owner: me
+blocks:
+  main:
+    steps:
+      s1:
+        activty: mark
+      s2:
+        pause: "yes"
+      s3:
+        context: [a, b]
+YAML);
+
+        $context = [];
+        try {
+            runner::run($yamlPath, $context);
+            $this->fail("an invalid flow must be rejected");
+        } catch (RuntimeException $e) {
+            $message = $e->getMessage();
+            $this->assertStringContainsString("unknown flow key 'owner'", $message);
+            $this->assertStringContainsString("unknown key 'activty' in step 'main.s1'", $message);
+            $this->assertStringContainsString("'pause' in step 'main.s2' must be true or false", $message);
+        }
+
+        // The context records the failure as well.
+        $this->assertSame("error", $context["_runner_state"]);
+        $this->assertNotEmpty($context["_runner_logs"]);
+        $this->assertNotEmpty($context["_runner_ended_at"]);
+    }
+
+    public function testInvalidTargetReferenceIsRejectedAtCompileTime(): void
+    {
+        $projectDir = $this->createTempProject();
+        $yamlPath = $projectDir . DIRECTORY_SEPARATOR . "bad-target.yml";
+        file_put_contents($yamlPath, "blocks:\n  main:\n    steps:\n      s1:\n        jump: nope.x\n");
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage("jump target block 'nope' not found");
+        runner::generateFlowCodeFromYaml($yamlPath);
+    }
+
+    public function testGeneratedCodeIsDeterministic(): void
+    {
+        $flowPath = __DIR__ . DIRECTORY_SEPARATOR . "flows" . DIRECTORY_SEPARATOR . "business_flow.yml";
+
+        $first = runner::generateFlowCodeFromYaml($flowPath);
+        $second = runner::generateFlowCodeFromYaml($flowPath);
+
+        $this->assertSame($first, $second);
+        $this->assertStringNotContainsString(date("Y-m-d"), $first);
+    }
+
     /**
      * Runs a YAML flow with `mark` (appends the step id to `trace`) and
      * `first_time` (true once per step id) available as functions.
      *
-     * @param array<string, mixed>|null $context Context to resume from.
+     * @param array<string, mixed>|null $context   Context to resume from; without `_root_folder` a project is created
+     *                                             and these keys are used as the initial context.
+     * @param array<string, string>     $functions Extra functions: name => body returning a value.
+     * @param array<string, string>     $flows     Child flows: name => YAML, compiled to PHP function files.
      *
      * @return array<string, mixed>
      */
-    private function runTraceFlow(string $yaml, ?array $context = null): array
+    private function runTraceFlow(string $yaml, ?array $context = null, array $functions = [], array $flows = []): array
     {
-        if ($context === null) {
+        if ($context === null || !isset($context["_root_folder"])) {
             $projectDir = $this->createTempProject();
+            $functionsDir = $projectDir . DIRECTORY_SEPARATOR . "functions";
             $this->writeFunctionFile($projectDir, "mark", "\$context['trace'][] = \$context['_current_step_id'];");
-            file_put_contents(
-                $projectDir . DIRECTORY_SEPARATOR . "functions" . DIRECTORY_SEPARATOR . "first_time.php",
-                "<?php\nreturn function (array &\$context): bool {\n"
-                . "    \$key = 'seen_' . \$context['_current_step_id'];\n"
-                . "    if (!empty(\$context[\$key])) { return false; }\n"
-                . "    \$context[\$key] = true;\n"
-                . "    return true;\n"
-                . "};\n"
-            );
-            $context = [
-                "trace" => [],
-                "_root_folder" => $projectDir . DIRECTORY_SEPARATOR . "functions",
-            ];
+            $functions["first_time"] = "\$key = 'seen_' . \$context['_current_step_id']; "
+                . "if (!empty(\$context[\$key])) { return false; } \$context[\$key] = true; return true;";
+            foreach ($functions as $name => $body) {
+                file_put_contents(
+                    $functionsDir . DIRECTORY_SEPARATOR . $name . ".php",
+                    "<?php\nreturn function (array &\$context): mixed {\n    {$body}\n};\n"
+                );
+            }
+            foreach ($flows as $name => $flowYaml) {
+                $flowYamlPath = $projectDir . DIRECTORY_SEPARATOR . $name . ".yml";
+                file_put_contents($flowYamlPath, $flowYaml);
+                file_put_contents(
+                    $functionsDir . DIRECTORY_SEPARATOR . $name . ".php",
+                    "<?php\n" . runner::generateFlowCodeFromYaml($flowYamlPath)
+                );
+            }
+            $context = array_merge(["trace" => []], $context ?? [], ["_root_folder" => $functionsDir]);
         }
 
         $yamlPath = $context["_root_folder"] . DIRECTORY_SEPARATOR . "flow-" . md5($yaml) . ".yml";

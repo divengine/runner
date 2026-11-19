@@ -38,6 +38,33 @@ final class runner
     private static $loggerSink = null;
 
     /**
+     * Default limit of nested calls, overridable with `_max_call_depth`.
+     */
+    public const MAX_CALL_DEPTH = 256;
+
+    /**
+     * Keys describing where the running flow is; restored after any activity.
+     */
+    private const SCOPE_KEYS = ["_current_block_id", "_current_step_id", "_current_step_index", "_flow_stack"];
+
+    /**
+     * Keys an activity may set on purpose; restored only after a nested pause.
+     */
+    private const FLOW_CONTROL_KEYS = ["_flow_state", "_autoresume"];
+
+    /**
+     * Runner services stored as closures that are never block callables.
+     */
+    private const SERVICE_KEYS = ["_logger", "_importer"];
+
+    /**
+     * Keys accepted in a YAML flow definition (root, block and step level).
+     */
+    private const FLOW_KEYS = ["id", "description", "blocks"];
+    private const BLOCK_KEYS = ["id", "description", "steps"];
+    private const STEP_KEYS = ["id", "description", "condition", "context", "call", "activity", "jump", "pause"];
+
+    /**
      * Sets a global logger callback used when no per-run logger is provided.
      *
      * @param callable|null $logger
@@ -115,6 +142,7 @@ final class runner
     public static function generateFlowCodeFromYaml(string $yamlPath, array $options = []): string
     {
         $flowDef = self::parseYamlFlowFile($yamlPath);
+        self::validateFlowSchema($flowDef, $yamlPath);
         $blocks = self::normalizeFlowBlocks($flowDef);
         self::validateFlowBlocks($blocks);
 
@@ -400,23 +428,35 @@ final class runner
             $logger("INFO", "[divengine.runner] Resuming paused job execution");
         }
 
-        $func = $flow;
-        if (is_string($flow)) {
-            $extension = strtolower(pathinfo($flow, PATHINFO_EXTENSION));
-            if ($extension === "yml" || $extension === "yaml") {
-                $func = self::flowFromYaml($flow, $options);
-            } else {
-                $func = self::importer($flow, $logger, $context);
+        // Setup failures (unreadable/invalid YAML, unresolved flow, bad signature)
+        // are thrown to the caller, with the context left in the `error` state.
+        try {
+            $func = $flow;
+            if (is_string($flow)) {
+                $extension = strtolower(pathinfo($flow, PATHINFO_EXTENSION));
+                if ($extension === "yml" || $extension === "yaml") {
+                    $func = self::flowFromYaml($flow, $options);
+                } else {
+                    $func = self::importer($flow, $logger, $context);
+                }
             }
-        }
 
-        if (!$func || !is_callable($func)) {
-            throw new RuntimeException(
-                "[divengine.runner] Flow '{$flowName}' must resolve to a callable."
-            );
-        }
+            if (!$func || !is_callable($func)) {
+                throw new RuntimeException(
+                    "[divengine.runner] Flow '{$flowName}' must resolve to a callable."
+                );
+            }
 
-        self::validateCallable($func, $requireContextParamName);
+            self::validateCallable($func, $requireContextParamName);
+        } catch (Throwable $e) {
+            $context["_runner_state"] = "error";
+            $context["_runner_error"] = self::dumpException($e);
+            $context["_runner_result"] = "Error: " . $e->getMessage();
+            $logger("ERROR", "[divengine.runner] Flow setup failed - " . $e->getMessage());
+            $context["_runner_logs"] = $records;
+            $context["_runner_ended_at"] = (new DateTimeImmutable())->format(DateTimeInterface::ATOM);
+            throw $e;
+        }
 
         // Pause may request auto-resume, so execution can loop until fully done/error.
         $resume = true;
@@ -433,6 +473,7 @@ final class runner
             } catch (Throwable $e) {
                 $classification = self::classifyException($e, $context);
                 if ($classification === "pause") {
+                    unset($context["_nested_flow_paused"]);
                     $context["_runner_state"] = "paused";
                     $context["_runner_result"] = "Paused execution at " . (new DateTimeImmutable())->format(DateTimeInterface::ATOM);
                     $context["_runner_error"] = null;
@@ -491,6 +532,27 @@ final class runner
             "[divengine.runner] Starting flow execution with initial block: {$initialBlock}"
         );
 
+        $depth = is_int($context["_flow_depth"] ?? null) ? $context["_flow_depth"] : 0;
+        $context["_flow_depth"] = $depth + 1;
+
+        try {
+            return self::runBlocks($initialBlock, $context, $tokens);
+        } catch (Throwable $e) {
+            if ($depth > 0 && self::isPauseException($e, $tokens)) {
+                // Tells the enclosing activity that this nested flow paused.
+                $context["_nested_flow_paused"] = true;
+            }
+            throw $e;
+        } finally {
+            $context["_flow_depth"] = $depth;
+        }
+    }
+
+    /**
+     * @param array{pause:string,jump:string} $tokens
+     */
+    private static function runBlocks(string $initialBlock, array &$context, array $tokens): mixed
+    {
         while (true) {
             $state = $context["_flow_state"] ?? [];
             $savedBlock = is_array($state) ? ($state["block"] ?? null) : null;
@@ -670,7 +732,41 @@ final class runner
     public static function wrapActivity(callable $func, string $stepId, int $stepIdx, array &$context): void
     {
         self::traceStep("activity", self::callableName($func), $stepId, $stepIdx, $context);
-        $context[$stepId] = $func($context);
+        $tokens = self::ensureTokens($context);
+
+        // A flow used as an activity has its own control state: it starts with
+        // an empty call stack, and the parent's scope comes back afterwards.
+        $snapshot = self::controlSnapshot($context);
+        $context["_flow_stack"] = [];
+
+        try {
+            $result = $func($context);
+        } catch (Throwable $e) {
+            if (!self::isPauseException($e, $tokens)) {
+                $context["_flow_stack"] = $snapshot["_flow_stack"] ?? [];
+                throw $e;
+            }
+
+            if (!empty($context["_nested_flow_paused"])) {
+                // A pause inside a nested flow is its early return: the parent's
+                // whole control state comes back and the result is null.
+                unset($context["_nested_flow_paused"]);
+                self::restoreControl($context, $snapshot, false);
+                $context[$stepId] = null;
+                return;
+            }
+
+            // The activity asked to pause the flow: pause at this step, without
+            // storing a result.
+            self::restoreControl($context, $snapshot, true);
+            $block = $context["_current_block_id"] ?? null;
+            self::wrapPause(is_string($block) ? $block : null, $stepId, $stepIdx, $context);
+        }
+
+        // Completed: the parent's blocks, position and call stack come back.
+        // `_flow_state` and `_autoresume` stay as the activity left them.
+        self::restoreControl($context, $snapshot, true);
+        $context[$stepId] = $result;
     }
 
     /**
@@ -711,6 +807,12 @@ final class runner
         }
 
         $stack = self::flowStack($context);
+        $maxDepth = is_int($context["_max_call_depth"] ?? null) ? $context["_max_call_depth"] : self::MAX_CALL_DEPTH;
+        if (count($stack) >= $maxDepth) {
+            throw new RuntimeException(
+                "[divengine.runner] Call depth exceeds {$maxDepth} at {$stepId}[{$stepIdx}] -> {$call} (recursive call?)."
+            );
+        }
         $stack[] = ["block" => $callerBlock ?? "", "step_index" => $stepIdx];
         $context["_flow_stack"] = $stack;
         $depth = count($stack);
@@ -758,7 +860,7 @@ final class runner
         array &$context,
         string $jump,
         int $targetIndex
-    ): void {
+    ): never {
         self::traceStep("jump", self::callableName($func), $stepId, $stepIdx, $context, $jump);
         $targetBlock = self::extractBlockTarget($jump, self::callableName($func));
         if ($targetBlock === "") {
@@ -786,7 +888,7 @@ final class runner
         ?string $stepId = null,
         ?int $stepIdx = null,
         array &$context = []
-    ): void {
+    ): never {
         if (func_num_args() < 4) {
             throw new RuntimeException(
                 "[divengine.runner] wrapPause requires shared context as the fourth argument."
@@ -1410,6 +1512,76 @@ final class runner
         }
     }
 
+    /**
+     * Rejects unknown keys and wrongly typed values in a flow definition, so a
+     * typo such as `activty:` fails instead of silently skipping the action.
+     * All problems are reported together.
+     *
+     * @param array<string, mixed> $flowDef
+     */
+    private static function validateFlowSchema(array $flowDef, string $yamlPath): void
+    {
+        $errors = [];
+
+        foreach (array_keys($flowDef) as $key) {
+            if (!in_array($key, self::FLOW_KEYS, true)) {
+                $errors[] = "unknown flow key '{$key}'";
+            }
+        }
+
+        $blocks = $flowDef["blocks"] ?? null;
+        if (is_array($blocks)) {
+            $isList = array_is_list($blocks);
+            foreach ($blocks as $blockKey => $block) {
+                if (!is_array($block)) {
+                    continue;
+                }
+                $blockId = $isList ? (string) ($block["id"] ?? "#{$blockKey}") : (string) $blockKey;
+                foreach (array_keys($block) as $key) {
+                    if (!in_array($key, self::BLOCK_KEYS, true) || ($key === "id" && !$isList)) {
+                        $errors[] = "unknown key '{$key}' in block '{$blockId}'";
+                    }
+                }
+
+                $steps = $block["steps"] ?? null;
+                if (!is_array($steps)) {
+                    continue;
+                }
+                $stepsAreList = array_is_list($steps);
+                foreach ($steps as $stepKey => $step) {
+                    if (!is_array($step)) {
+                        continue;
+                    }
+                    $stepId = $stepsAreList ? (string) ($step["id"] ?? "#{$stepKey}") : (string) $stepKey;
+                    $where = "step '{$blockId}.{$stepId}'";
+                    foreach ($step as $key => $value) {
+                        if (!in_array($key, self::STEP_KEYS, true) || ($key === "id" && !$stepsAreList)) {
+                            $errors[] = "unknown key '{$key}' in {$where}";
+                            continue;
+                        }
+                        if ($value === null || $key === "id" || $key === "description") {
+                            continue;
+                        }
+                        if ($key === "pause" && !is_bool($value)) {
+                            $errors[] = "'pause' in {$where} must be true or false";
+                        } elseif ($key === "context" && (!is_array($value) || ($value !== [] && array_is_list($value)))) {
+                            $errors[] = "'context' in {$where} must be a mapping";
+                        } elseif (in_array($key, ["condition", "activity", "call", "jump"], true)
+                            && (!is_string($value) || trim($value) === "")) {
+                            $errors[] = "'{$key}' in {$where} must be a non-empty string";
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($errors !== []) {
+            throw new RuntimeException(
+                "[divengine.runner] Invalid YAML flow '{$yamlPath}': " . implode("; ", $errors) . "."
+            );
+        }
+    }
+
     private static function validateReferenceSyntax(string $reference, string $kind): void
     {
         if (!str_contains($reference, ".")) {
@@ -1793,6 +1965,81 @@ final class runner
     private static function isJumpException(Throwable $e, array $tokens): bool
     {
         return $tokens["jump"] !== "" && str_contains($e->getMessage(), $tokens["jump"]);
+    }
+
+    /**
+     * @param Throwable                     $e
+     * @param array{pause:string,jump:string} $tokens
+     */
+    private static function isPauseException(Throwable $e, array $tokens): bool
+    {
+        return $tokens["pause"] !== "" && str_contains($e->getMessage(), $tokens["pause"]);
+    }
+
+    /**
+     * Whether a context key belongs to the scope of the running flow: its
+     * position, call stack and block callables (`_<block_id>` closures).
+     */
+    private static function isScopeKey(string|int $key, mixed $value): bool
+    {
+        if (!is_string($key)) {
+            return false;
+        }
+
+        if (in_array($key, self::SCOPE_KEYS, true)) {
+            return true;
+        }
+
+        return $value instanceof \Closure
+            && str_starts_with($key, "_")
+            && !str_starts_with($key, "__")
+            && !in_array($key, self::SERVICE_KEYS, true);
+    }
+
+    /**
+     * Snapshot of the control keys a nested flow may change.
+     *
+     * @param array<string, mixed> $context
+     *
+     * @return array<string, mixed>
+     */
+    private static function controlSnapshot(array $context): array
+    {
+        $snapshot = [];
+        foreach ($context as $key => $value) {
+            if (self::isScopeKey($key, $value) || in_array($key, self::FLOW_CONTROL_KEYS, true)) {
+                $snapshot[$key] = $value;
+            }
+        }
+
+        return $snapshot;
+    }
+
+    /**
+     * Restores the scope keys (and, unless `$scopeOnly`, also the flow control
+     * keys) from a snapshot, removing the ones the activity added.
+     *
+     * @param array<string, mixed> $context
+     * @param array<string, mixed> $snapshot
+     */
+    private static function restoreControl(array &$context, array $snapshot, bool $scopeOnly): void
+    {
+        $selected = function (string|int $key, mixed $value) use ($scopeOnly): bool {
+            return self::isScopeKey($key, $value)
+                || (!$scopeOnly && in_array($key, self::FLOW_CONTROL_KEYS, true));
+        };
+
+        foreach ($context as $key => $value) {
+            if ($selected($key, $value)) {
+                unset($context[$key]);
+            }
+        }
+
+        foreach ($snapshot as $key => $value) {
+            if ($selected($key, $value)) {
+                $context[$key] = $value;
+            }
+        }
     }
 
     /**
