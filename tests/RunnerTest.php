@@ -666,6 +666,24 @@ YAML;
         fclose($resource);
     }
 
+    public function testImporterPrefersFileOverSameNamedCallable(): void
+    {
+        $projectDir = $this->createTempProject();
+        $functionsDir = $projectDir . DIRECTORY_SEPARATOR . "functions";
+        $this->writeFunctionFile($projectDir, "strtoupper", "\$context['from_file'] = true;");
+
+        $callable = runner::importer("strtoupper", null, ["_root_folder" => $functionsDir]);
+        $this->assertIsCallable($callable);
+        $this->assertNotSame("strtoupper", $callable);
+
+        $context = ["from_file" => false];
+        $callable($context);
+        $this->assertTrue($context["from_file"]);
+
+        // Without a matching file the callable identifier is still the fallback.
+        $this->assertSame("strtoupper", runner::importer("strtoupper", null, ["_root_folder" => $projectDir]));
+    }
+
     private function createTempProject(): string
     {
         $tempDir = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR)

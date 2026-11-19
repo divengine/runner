@@ -69,10 +69,10 @@ final class runner
             return null;
         }
 
+        // Resolution order: PHP files first (root folder, then the raw path),
+        // and only then callable identifiers such as `strlen` or `ns\fn`.
         $callableReference = ltrim($reference, "\\");
-        if (is_callable($callableReference)) {
-            return $callableReference;
-        }
+
 
         $candidates = self::buildImportPathCandidates($reference, $context);
         foreach ($candidates as $candidate) {
