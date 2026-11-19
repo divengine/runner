@@ -35,20 +35,24 @@ Status of v0.1.0. Test names refer to `tests/RunnerTest.php`.
 | Pause and resume (`_flow_state`) | Resume continues after the paused step. | `testRunPauseResumeFixtureFlowResumesFromSavedStep`, `testCheckPauseUsesSavedFlowState` |
 | Pause requested by an activity | Pauses at that step; the result is not stored. | `testActivityPauseCheckpointsItsStepWithoutStoringResult` |
 | `_autoresume` | Resumes immediately once. | `testRunAutoResumesWhenAutoresumeIsEnabled`, `testAutoresumeInsideCalledBlockReturnsIntoCaller` |
-| Flow used as an activity | Own control scope; parent blocks, position and call stack restored; `_flow_state`/`_autoresume` kept as the activity left them. | `testNestedFlowActivityRestoresParentBlocks` |
+| Flow used as an activity | Own control scope; parent blocks (`_flow_blocks`), position and call stack restored; `_flow_state`/`_autoresume` and any other key kept as the activity left them. | `testNestedFlowActivityRestoresParentBlocks`, `testActivityClosuresUnderUnderscoreKeysPersist` |
 | Pause inside a nested flow | Early return of the nested flow (result `null`); the parent continues (ADR-I2-S01). | `testPauseInsideNestedFlowIsAnEarlyReturn` |
 | Activity/condition resolution | PHP file under `_root_folder` / `DIV_RUNNER_ROOT_FOLDER`, then path, then callable name. | `testImporterPrefersFileOverSameNamedCallable`, `testRunYamlResolvesActivitiesUsingRuntimeRootFolder`, `testImporterAcceptsNamespacedCallableIdentifier` |
 | Missing or failing functions | Run ends in `error` with a log entry naming the function. | `testMissingActivityMarksErrorState`, `testImporterHandlesRequireErrorAndLogsException`, `testImporterFailsWhenFileDoesNotReturnCallable` |
 | Deterministic compilation | Same YAML ⇒ byte-identical PHP. | `testGeneratedCodeIsDeterministic` |
 | Schema validation | Unknown flow/block/step keys and wrong types are rejected. | `testSchemaRejectsUnknownKeysAndWrongTypes` |
-| YAML subset used by real flows | Block scalars, one-line flow collections, comments, quoted keys. All 22 `vvm_striders` fixture flows parse identically to PyYAML `safe_load`. | `testYamlParserSupportsBlockScalarsFlowCollectionsAndComments` |
+| YAML subset used by real flows | Block scalars, one-line flow collections, nested and indentless sequences, comments, quoted keys, YAML 1.1 scalar resolution as PyYAML `safe_load` (`yes`/`off` booleans, `0x1F`, `017`, `.5`). All 22 `vvm_striders` fixture flows parse identically to PyYAML. | `testYamlParserSupportsBlockScalarsFlowCollectionsAndComments`, `testYamlParserMatchesPyYamlOnSequenceItemsAndScalars`, `testYamlParserRejectsMisindentedBlockScalarAndBadQuotes` |
+| Errors do not leave resumable state | A failed run drops pending call frames, so running again starts cleanly. | `testErrorInsideCalledBlockLeavesNoStaleCallFrames` |
 
 ## Known divergences
 
 | Behavior | `vvm_strider_jobs` | Runner | Reason |
 |---|---|---|---|
 | Pause inside a called block | Call return frames are Python frames and are not persisted: after resume the called block finishes and the flow ends (ADR-I2-S02). | Return frames are plain data in `_flow_stack`, persisted with the context: after resume the called block finishes and control returns into the calling step. | Keeps `call` semantics across a pause. Tests: `testPauseInsideCalledBlockResumesIntoCaller`, `testPauseInsideNestedCallsResumesThroughEveryCaller`, `testJumpFromResumedCalleeToSuspendedCallerRestartsIt`. |
-| Recursion | Limited by the Python recursion limit. | `_max_call_depth` (default 256) fails the run with a clear error. | Avoids exhausting the PHP stack. Test: `testRecursiveCallStopsAtMaxCallDepth`. |
+| Pause inside a call made by hand-written PHP | — | A `wrapCall()` without its `$fromBlock` argument keeps the Python behavior: the continuation is dropped on resume. | Pre-0.1 flow files keep working. Test: `testLegacyCallWithoutCallingBlockKeepsPreviousResumeBehavior`. |
+| Recursion | Limited by the Python recursion limit. | `_max_call_depth` (default 256) limits both nested calls and flows nested as activities. | Avoids exhausting the PHP stack. Tests: `testRecursiveCallStopsAtMaxCallDepth`, `testFlowUsingItselfAsActivityStopsAtMaxDepth`. |
+| Identifiers | Sanitized by the modeler. | Block and step ids must not start with `_` (reserved context keys) or contain `.`. | Activity results and block callables live in the context. Test: `testIdsStartingWithUnderscoreAreRejected`. |
+| Condition truthiness | Python truthiness (`"0"` is true). | PHP truthiness (`"0"` is false). | Return booleans from conditions. |
 | YAML root | `striders:` | `blocks:` | Runner naming. Rename the key to run a `vvm_striders` flow. |
 | Function references | Module-qualified (`module:` per step, `module:name`). | Root folder + name, path or callable name; `module` is rejected. | No Odoo addons in Runner. |
 | Control-flow signals | Exception classes. | Per-run random tokens in exception messages. | Activities need no Runner classes. |
@@ -57,7 +61,8 @@ Status of v0.1.0. Test names refer to `tests/RunnerTest.php`.
 
 | Behavior | Status |
 |---|---|
-| YAML | A subset: no anchors/aliases/tags, no multi-line flow collections, no multi-line plain scalars. These fail with an explicit error. YAML 1.1 booleans (`yes`/`no`/`on`/`off`) are strings. |
+| YAML | A subset: no anchors/aliases/tags, no multi-line flow collections, no multi-line plain scalars (explicit errors). Timestamps and sexagesimal numbers stay strings. A few inputs that PyYAML rejects (`a: b:c`, `b: - foo`) are read as strings. |
+| Flows used as conditions | Not scoped like activities; use flows as activities only. |
 | Function signature checks | Enforced for the flow entry point (`array &$context`); activities and conditions are called with the context without a signature check. |
 | Diagnostics | Messages and logs, without the stable error codes of `FunctionResolutionError`. |
 

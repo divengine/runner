@@ -142,8 +142,10 @@ A step may combine these keys; they run in this order:
 6. `pause`: `true`; stops the run so it can be resumed after this step.
 
 Blocks do not fall through: the flow ends when the running block finishes.
-`block.` targets step 0 of a block and `.step` the current block. Unknown keys
-and wrongly typed values are rejected when the flow is compiled.
+`block.` targets step 0 of a block and `.step` the current block. Block and step
+ids must not start with `_` (reserved keys) or contain `.`. Unknown keys and
+wrongly typed values are rejected when the flow is compiled. Conditions use PHP
+truthiness, so return booleans.
 
 ### Compile to PHP
 
@@ -196,8 +198,9 @@ thrown to the caller and also recorded in the context.
 
 Limitations: closures and objects in the context are not serializable, so they
 must be re-provided when you resume from storage; a resumed run does not
-re-apply your initial context for you; jump loops are not limited (recursive
-calls are, by `_max_call_depth`, default 256).
+re-apply your initial context for you; a failed run drops pending call frames;
+jump loops are not limited (recursive calls and nested flows are, by
+`_max_call_depth`, default 256).
 
 ## Logging
 

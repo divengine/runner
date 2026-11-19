@@ -572,9 +572,11 @@ YAML;
         $this->assertSame("ok-1", $context["activity_result"]);
 
         $called = false;
+        $stateDuringCall = null;
         runner::wrapCall(
-            function (array &$ctx) use (&$called): void {
+            function (array &$ctx) use (&$called, &$stateDuringCall): void {
                 $called = true;
+                $stateDuringCall = $ctx["_flow_state"];
                 $ctx["call_ran"] = true;
             },
             "call",
@@ -585,8 +587,11 @@ YAML;
         );
         $this->assertTrue($called);
         $this->assertTrue((bool) ($context["call_ran"] ?? false));
-        $this->assertSame("call_target", $context["_flow_state"]["block"] ?? null);
-        $this->assertSame(9, $context["_flow_state"]["step_index"] ?? null);
+        // The called block starts at the target step...
+        $this->assertSame(["block" => "call_target", "step_index" => 9], $stateDuringCall);
+        // ...and an unconsumed pointer does not outlive the call.
+        $this->assertSame([], $context["_flow_state"]);
+        $this->assertSame([], $context["_flow_stack"]);
     }
 
     public function testWrapJumpSetsStateAndThrowsJumpToken(): void
@@ -1231,6 +1236,188 @@ YAML);
         $this->expectException(RuntimeException::class);
         $this->expectExceptionMessage("Block id 'flow_state' is reserved");
         runner::generateFlowCodeFromYaml($yamlPath);
+    }
+
+    public function testErrorInsideCalledBlockLeavesNoStaleCallFrames(): void
+    {
+        $yaml = <<<YAML
+blocks:
+  main:
+    steps:
+      s1:
+        call: sub.b1
+      s2:
+        activity: mark
+  sub:
+    steps:
+      b1:
+        activity: fail_once
+      b2:
+        activity: mark
+YAML;
+        $failOnce = "if (empty(\$context['failed'])) { \$context['failed'] = true; throw new \\RuntimeException('boom'); } return 'ok';";
+
+        $context = $this->runTraceFlow($yaml, null, ["fail_once" => $failOnce]);
+        $this->assertSame("error", $context["_runner_state"]);
+        $this->assertSame([], $context["_flow_stack"]);
+
+        $context = $this->runTraceFlow($yaml, $context);
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame(["b2", "s2"], $context["trace"]);
+    }
+
+    public function testActivityClosuresUnderUnderscoreKeysPersist(): void
+    {
+        $context = $this->runTraceFlow(<<<YAML
+blocks:
+  main:
+    steps:
+      s1:
+        activity: set_helper
+      s2:
+        activity: use_helper
+YAML, ["_svc" => fn (): string => "old"], [
+            "set_helper" => "\$context['_fmt'] = fn (string \$v): string => strtoupper(\$v); "
+                . "\$context['_svc'] = fn (): string => 'new'; return null;",
+            "use_helper" => "return (\$context['_fmt'])('x') . (\$context['_svc'])();",
+        ]);
+
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame("Xnew", $context["s2"]);
+    }
+
+    public function testLegacyCallWithoutCallingBlockKeepsPreviousResumeBehavior(): void
+    {
+        // Hand-written flow from before `_resume_after_call`: wrapCall without $fromBlock.
+        $flow = function (array &$context): void {
+            $context["_main"] = function (array &$context): void {
+                if ($context["_check_pause"](1, $context)) {
+                    $context["trace"][] = "s1";
+                }
+                if ($context["_check_pause"](2, $context)) {
+                    $context["_wrap_call"]($context["_sub"], "s2", 2, $context, "sub.", 0);
+                }
+                if ($context["_check_pause"](3, $context)) {
+                    $context["trace"][] = "s3";
+                }
+            };
+            $context["_sub"] = function (array &$context): void {
+                if ($context["_check_pause"](1, $context) && empty($context["paused"])) {
+                    $context["paused"] = true;
+                    $context["_wrap_pause"]("sub", "b1", 1, $context);
+                }
+                if ($context["_check_pause"](2, $context)) {
+                    $context["trace"][] = "b2";
+                }
+            };
+            $context["__flow_loop"]("main", $context);
+        };
+
+        $context = ["trace" => []];
+        runner::run($flow, $context);
+        $this->assertSame("paused", $context["_runner_state"]);
+
+        runner::run($flow, $context);
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame(["s1", "b2"], $context["trace"]);
+    }
+
+    public function testIdsStartingWithUnderscoreAreRejected(): void
+    {
+        $projectDir = $this->createTempProject();
+        $cases = [
+            "blocks:\n  _x:\n    steps:\n      s1:\n        pause: true\n" => "Block id '_x' is reserved",
+            "blocks:\n  main:\n    steps:\n      _flow_stack:\n        pause: true\n" => "Step id '_flow_stack' in block 'main' cannot start with '_'",
+        ];
+
+        foreach ($cases as $yaml => $expected) {
+            $yamlPath = $projectDir . DIRECTORY_SEPARATOR . md5($yaml) . ".yml";
+            file_put_contents($yamlPath, $yaml);
+            try {
+                runner::generateFlowCodeFromYaml($yamlPath);
+                $this->fail("must be rejected: {$expected}");
+            } catch (RuntimeException $e) {
+                $this->assertStringContainsString($expected, $e->getMessage());
+            }
+        }
+    }
+
+    public function testFlowUsingItselfAsActivityStopsAtMaxDepth(): void
+    {
+        $child = "blocks:\n  main:\n    steps:\n      again:\n        activity: child_flow\n";
+        $context = $this->runTraceFlow($child, ["_max_call_depth" => 4], [], ["child_flow" => $child]);
+
+        $this->assertSame("error", $context["_runner_state"]);
+        $this->assertStringContainsString("Nested flow depth exceeds 4", $context["_runner_result"]);
+        $this->assertSame(0, $context["_flow_depth"]);
+    }
+
+    public function testContextUpdateKeepsIntegerKeys(): void
+    {
+        $context = [10 => "orig"];
+        runner::updateContext($context, [10 => "x", 7 => "y"], "s1", 1);
+
+        $this->assertSame("x", $context[10]);
+        $this->assertSame("y", $context[7]);
+    }
+
+    public function testYamlParserMatchesPyYamlOnSequenceItemsAndScalars(): void
+    {
+        $context = $this->runTraceFlow(implode("\n", [
+            "blocks:",
+            "  main:",
+            "    description: don't touch # trailing comment",
+            "    steps:",
+            "      s1:",
+            "        context:",
+            "          items:",
+            "            - note: |",
+            "                fragile",
+            "              qty: 2",
+            "            - context:",
+            "              a: 1",
+            "          nested:",
+            "            - - x",
+            "              - y",
+            "            - - z",
+            "          indentless:",
+            "          - one",
+            "          - two",
+            "          yaml11: [yes, Off, 0x1F, 017, .5, +1, 1_000, 1e3, ~, tRuE]",
+            "          flow_keys: {true: a, null: b}",
+            "          tail: |",
+            "            last",
+        ]));
+
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame([["note" => "fragile\n", "qty" => 2], ["context" => null, "a" => 1]], $context["items"]);
+        $this->assertSame([["x", "y"], ["z"]], $context["nested"]);
+        $this->assertSame(["one", "two"], $context["indentless"]);
+        $this->assertSame([true, false, 31, 15, 0.5, 1, 1000, "1e3", null, "tRuE"], $context["yaml11"]);
+        $this->assertSame(["true" => "a", "null" => "b"], $context["flow_keys"]);
+        // Last line of the file without a line break: no final newline (as PyYAML).
+        $this->assertSame("last", $context["tail"]);
+    }
+
+    public function testYamlParserRejectsMisindentedBlockScalarAndBadQuotes(): void
+    {
+        $projectDir = $this->createTempProject();
+        $cases = [
+            "a: |\n    x\n  y\n" => "less indented than its first line",
+            "a: \"abc\n" => "unterminated or malformed quoted scalar",
+        ];
+
+        foreach ($cases as $body => $expected) {
+            $yamlPath = $projectDir . DIRECTORY_SEPARATOR . md5($body) . ".yml";
+            $indented = preg_replace('/^/m', "          ", $body);
+            file_put_contents($yamlPath, "blocks:\n  main:\n    steps:\n      s1:\n        context:\n" . $indented);
+            try {
+                runner::generateFlowCodeFromYaml($yamlPath);
+                $this->fail("must be rejected: {$expected}");
+            } catch (RuntimeException $e) {
+                $this->assertStringContainsString($expected, $e->getMessage());
+            }
+        }
     }
 
     public function testGeneratedCodeIsDeterministic(): void

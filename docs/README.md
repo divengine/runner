@@ -120,7 +120,8 @@ Control-flow semantics (aligned with the `vvm_strider_jobs` runtime):
 - `jump` transfers control without returning. The nearest invocation running the target block restarts at the target step; otherwise the target block becomes the running block and pending call continuations are dropped.
 - Blocks do not fall through: the flow ends when the running block returns.
 - `pause` stores the position in `_flow_state`; running the flow again with the same context resumes after the paused step. Pending call return frames are kept in `_flow_stack`, so a pause inside a called block resumes back into its caller. This differs from `vvm_strider_jobs`, where call continuations are not persisted and a resume inside a called block ends the flow when that block returns.
-- YAML parsing is handled internally by runner for flow DSL inputs (no external YAML package at runtime). Supported: block mappings and sequences, plain/quoted scalars, block scalars (`|`, `>`, `-`/`+` chomping), one-line flow collections (`[a, b]`, `{k: v}`), comments. Anchors, aliases, tags and multi-line flow collections are rejected.
+- YAML parsing is handled internally by runner for flow DSL inputs (no external YAML package at runtime). Supported: block mappings and sequences (including indentless and `- - x` nested sequences), plain/quoted scalars with YAML 1.1 resolution as PyYAML `safe_load`, block scalars (`|`, `>`, `-`/`+` chomping), one-line flow collections (`[a, b]`, `{k: v}`), comments. Anchors, aliases, tags and multi-line flow collections are rejected.
+- Block and step ids must not start with `_` or contain `.`.
 
 Function root precedence during YAML execution:
 

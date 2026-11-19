@@ -45,17 +45,12 @@ final class runner
     /**
      * Keys describing where the running flow is; restored after any activity.
      */
-    private const SCOPE_KEYS = ["_current_block_id", "_current_step_id", "_current_step_index", "_flow_stack"];
+    private const SCOPE_KEYS = ["_current_block_id", "_current_step_id", "_current_step_index", "_flow_stack", "_flow_blocks"];
 
     /**
      * Keys an activity may set on purpose; restored only after a nested pause.
      */
     private const FLOW_CONTROL_KEYS = ["_flow_state", "_autoresume"];
-
-    /**
-     * Runner services stored as closures that are never block callables.
-     */
-    private const SERVICE_KEYS = ["_logger", "_importer"];
 
     /**
      * Keys accepted in a YAML flow definition (root, block and step level).
@@ -72,7 +67,7 @@ final class runner
         "_wrap_jump", "_wrap_pause", "_check_pause", "_resume_after_call", "__flow_loop", "_exception_pause",
         "_exception_jump", "_exception_pause_token", "_exception_jump_token", "_flow_state", "_flow_stack",
         "_flow_depth", "_nested_flow_paused", "_current_block_id", "_current_step_id", "_current_step_index",
-        "_autoresume", "_max_call_depth",
+        "_autoresume", "_max_call_depth", "_flow_blocks",
     ];
 
     /**
@@ -207,6 +202,9 @@ final class runner
         $lines[] = "        return \$callable;";
         $lines[] = "    };";
         $lines[] = "";
+
+        $blockListCode = var_export(array_column($blocks, "id"), true);
+        $lines[] = "    \$context[\"_flow_blocks\"] = " . str_replace("\n", " ", $blockListCode) . ";";
 
         foreach ($blocks as $block) {
             $blockId = $block["id"];
@@ -388,7 +386,7 @@ final class runner
         $logger = self::makeLogger($loggerSink, $records);
 
         if (isset($options["shared_context"]) && is_array($options["shared_context"])) {
-            $context = array_merge($options["shared_context"], $context);
+            $context = array_replace($options["shared_context"], $context);
         }
 
         $initialSnapshot = $context;
@@ -502,6 +500,8 @@ final class runner
                 $context["_runner_state"] = "error";
                 $context["_runner_error"] = self::dumpException($e);
                 $context["_runner_result"] = "Error: " . $e->getMessage();
+                // Call return frames only matter to resume a pause.
+                $context["_flow_stack"] = [];
                 $logger("ERROR", "[divengine.runner] Error processing job - " . $context["_runner_error"]);
             }
         }
@@ -544,6 +544,12 @@ final class runner
         );
 
         $depth = is_int($context["_flow_depth"] ?? null) ? $context["_flow_depth"] : 0;
+        $maxDepth = is_int($context["_max_call_depth"] ?? null) ? $context["_max_call_depth"] : self::MAX_CALL_DEPTH;
+        if ($depth >= $maxDepth) {
+            throw new RuntimeException(
+                "[divengine.runner] Nested flow depth exceeds {$maxDepth} (a flow using itself as an activity?)."
+            );
+        }
         $context["_flow_depth"] = $depth + 1;
 
         try {
@@ -664,7 +670,7 @@ final class runner
      */
     public static function updateContext(array &$context, array $data, string $stepId, int $stepIdx): void
     {
-        $context = array_merge($context, $data);
+        $context = array_replace($context, $data);
         self::traceStep("context.update", "updateContext", $stepId, $stepIdx, $context);
     }
 
@@ -747,8 +753,9 @@ final class runner
 
         // A flow used as an activity has its own control state: it starts with
         // an empty call stack, and the parent's scope comes back afterwards.
-        $snapshot = self::controlSnapshot($context);
+        $snapshot = $context;
         $context["_flow_stack"] = [];
+        unset($context["_nested_flow_paused"]);
 
         try {
             $result = $func($context);
@@ -795,7 +802,9 @@ final class runner
      * @param array       $context
      * @param string      $call
      * @param int         $targetIndex
-     * @param string|null $fromBlock Calling block; defaults to `_current_block_id`.
+     * @param string|null $fromBlock Calling block. Generated flows pass it, which makes the call
+     *                               resumable after a pause inside the called block; without it the
+     *                               continuation is dropped on resume (as in `vvm_strider_jobs`).
      */
     public static function wrapCall(
         callable $func,
@@ -816,6 +825,10 @@ final class runner
         if ($callerBlock === null && isset($context["_current_block_id"]) && is_string($context["_current_block_id"])) {
             $callerBlock = $context["_current_block_id"];
         }
+        // Only callers that pass `$fromBlock` (generated flows) can be re-entered
+        // after the call through `_resume_after_call`; other frames are kept for
+        // jump resolution but are not resumed.
+        $frameBlock = $fromBlock ?? "";
 
         $stack = self::flowStack($context);
         $maxDepth = is_int($context["_max_call_depth"] ?? null) ? $context["_max_call_depth"] : self::MAX_CALL_DEPTH;
@@ -824,7 +837,7 @@ final class runner
                 "[divengine.runner] Call depth exceeds {$maxDepth} at {$stepId}[{$stepIdx}] -> {$call} (recursive call?)."
             );
         }
-        $stack[] = ["block" => $callerBlock ?? "", "step_index" => $stepIdx];
+        $stack[] = ["block" => $frameBlock, "step_index" => $stepIdx];
         $context["_flow_stack"] = $stack;
         $depth = count($stack);
         $tokens = self::ensureTokens($context);
@@ -850,6 +863,11 @@ final class runner
 
         $context["_flow_stack"] = array_slice(self::flowStack($context), 0, $depth - 1);
         $context["_current_block_id"] = $callerBlock;
+
+        // A pointer into the called block that no step consumed (empty block).
+        if (($context["_flow_state"]["block"] ?? null) === $targetBlock) {
+            $context["_flow_state"] = [];
+        }
     }
 
     /**
@@ -1060,23 +1078,41 @@ final class runner
             }
 
             $indent = strlen($matches[1]);
+            $content = rtrim(ltrim($withoutComments));
+
+            // `- - x` is a sequence item whose value is a sequence: split it
+            // into `-` and `- x` one level deeper.
+            while (preg_match('/^(- +)(-(?: .*)?)$/', $content, $nested) === 1) {
+                $lines[] = ["indent" => $indent, "content" => "-", "line" => $lineNumber + 1];
+                $indent += strlen($nested[1]);
+                $content = $nested[2];
+            }
+
             $entry = [
                 "indent" => $indent,
-                "content" => rtrim(ltrim($withoutComments)),
+                "content" => $content,
                 "line" => $lineNumber + 1,
             ];
 
             if (preg_match('/(?:^|:\s+|^-\s+)([|>])([-+]?)$/', $entry["content"], $block) === 1) {
+                // The block belongs to the node that introduces it: a key's column,
+                // or the dash of a sequence item (`- |`).
+                preg_match('/^((?:- +)*)/', $entry["content"], $dashes);
+                $prefix = strlen($dashes[1]);
+                $rest = substr($entry["content"], $prefix);
+                $parentIndent = preg_match('/^[|>]/', $rest) === 1 ? $indent + max(0, $prefix - 2) : $indent + $prefix;
+
                 $blockLines = [];
                 while ($lineNumber + 1 < $count) {
                     $next = $rawLines[$lineNumber + 1];
-                    if (trim($next) !== "" && strspn($next, " ") <= $indent) {
+                    if (trim($next) !== "" && strspn($next, " ") <= $parentIndent) {
                         break;
                     }
                     $blockLines[] = $next;
                     $lineNumber++;
                 }
-                $entry["block"] = self::foldYamlBlock($blockLines, $block[1], $block[2]);
+                $atEndWithoutBreak = $lineNumber === $count - 1 && !preg_match('/[\\r\\n]$/', $contents);
+                $entry["block"] = self::foldYamlBlock($blockLines, $block[1], $block[2], $entry["line"], !$atEndWithoutBreak);
             }
 
             $lines[] = $entry;
@@ -1090,8 +1126,13 @@ final class runner
      *
      * @param array<int, string> $rawLines
      */
-    private static function foldYamlBlock(array $rawLines, string $style, string $chomping): string
-    {
+    private static function foldYamlBlock(
+        array $rawLines,
+        string $style,
+        string $chomping,
+        int $lineNumber,
+        bool $finalBreak = true
+    ): string {
         $blockIndent = null;
         foreach ($rawLines as $rawLine) {
             if (trim($rawLine) !== "") {
@@ -1101,7 +1142,13 @@ final class runner
         }
 
         $contentLines = [];
-        foreach ($rawLines as $rawLine) {
+        foreach ($rawLines as $offset => $rawLine) {
+            if ($blockIndent !== null && trim($rawLine) !== "" && strspn($rawLine, " ") < $blockIndent) {
+                $line = $lineNumber + $offset + 1;
+                throw new RuntimeException(
+                    "[divengine.runner] Invalid YAML in line {$line}: block scalar line is less indented than its first line."
+                );
+            }
             $contentLines[] = $blockIndent === null || trim($rawLine) === ""
                 ? ""
                 : (string) substr($rawLine, $blockIndent);
@@ -1137,10 +1184,12 @@ final class runner
             return $chomping === "+" ? str_repeat("\n", $trailing) : "";
         }
 
+        $break = $finalBreak || $trailing > 0 ? "\n" : "";
+
         return match ($chomping) {
             "-" => $text,
-            "+" => $text . "\n" . str_repeat("\n", $trailing),
-            default => $text . "\n",
+            "+" => $text . $break . str_repeat("\n", max(0, $trailing - ($finalBreak ? 0 : 1))),
+            default => $text . $break,
         };
     }
 
@@ -1149,6 +1198,7 @@ final class runner
         $length = strlen($line);
         $quote = null;
         $escaped = false;
+        $previous = "";
 
         for ($i = 0; $i < $length; $i++) {
             $char = $line[$i];
@@ -1166,6 +1216,7 @@ final class runner
 
                 if ($char === '"') {
                     $quote = null;
+                    $previous = $char;
                 }
                 continue;
             }
@@ -1173,17 +1224,23 @@ final class runner
             if ($quote === "'") {
                 if ($char === "'") {
                     $quote = null;
+                    $previous = $char;
                 }
                 continue;
             }
 
-            if ($char === '"' || $char === "'") {
+            // A quote opens a quoted scalar only where a scalar starts (`it's` is plain).
+            if (($char === '"' || $char === "'") && ($previous === "" || str_contains(":-,[{?", $previous))) {
                 $quote = $char;
                 continue;
             }
 
             if ($char === "#" && ($i === 0 || $line[$i - 1] === " " || $line[$i - 1] === "\t")) {
                 return rtrim(substr($line, 0, $i));
+            }
+
+            if ($char !== " " && $char !== "\t") {
+                $previous = $char;
             }
         }
 
@@ -1214,11 +1271,40 @@ final class runner
             );
         }
 
-        if (str_starts_with($entry["content"], "-")) {
+        if (self::isYamlSequenceLine($entry["content"])) {
             return self::parseYamlSequence($lines, $index, $indent);
         }
 
         return self::parseYamlMapping($lines, $index, $indent);
+    }
+
+    private static function isYamlSequenceLine(string $content): bool
+    {
+        return $content === "-" || str_starts_with($content, "- ");
+    }
+
+    /**
+     * Value of a key with nothing after its colon: a deeper node, an indentless
+     * sequence at the key's column (`key:` followed by `- item`), or null.
+     *
+     * @param array<int, array{indent:int,content:string,line:int,block?:string}> $lines
+     */
+    private static function parseYamlKeyNode(array $lines, int &$index, int $keyIndent): mixed
+    {
+        if (!isset($lines[$index])) {
+            return null;
+        }
+
+        $next = $lines[$index];
+        if ($next["indent"] > $keyIndent) {
+            return self::parseYamlNode($lines, $index, $next["indent"]);
+        }
+
+        if ($next["indent"] === $keyIndent && self::isYamlSequenceLine($next["content"])) {
+            return self::parseYamlSequence($lines, $index, $keyIndent, true);
+        }
+
+        return null;
     }
 
     /**
@@ -1244,7 +1330,7 @@ final class runner
                 );
             }
 
-            if (str_starts_with($entry["content"], "-")) {
+            if (self::isYamlSequenceLine($entry["content"])) {
                 throw new RuntimeException(
                     "[divengine.runner] Invalid YAML in line {$entry["line"]}: sequence item found where mapping is expected."
                 );
@@ -1268,12 +1354,7 @@ final class runner
                 continue;
             }
 
-            if (!isset($lines[$index]) || $lines[$index]["indent"] <= $indent) {
-                $result[$key] = null;
-                continue;
-            }
-
-            $result[$key] = self::parseYamlNode($lines, $index, $lines[$index]["indent"]);
+            $result[$key] = self::parseYamlKeyNode($lines, $index, $indent);
         }
 
         return $result;
@@ -1286,7 +1367,7 @@ final class runner
      *
      * @return array<int, mixed>
      */
-    private static function parseYamlSequence(array $lines, int &$index, int $indent): array
+    private static function parseYamlSequence(array $lines, int &$index, int $indent, bool $indentless = false): array
     {
         $result = [];
 
@@ -1302,7 +1383,10 @@ final class runner
                 );
             }
 
-            if (!str_starts_with($entry["content"], "-")) {
+            if (!self::isYamlSequenceLine($entry["content"])) {
+                if ($indentless) {
+                    break;
+                }
                 throw new RuntimeException(
                     "[divengine.runner] Invalid YAML in line {$entry["line"]}: mapping found where sequence item is expected."
                 );
@@ -1326,20 +1410,25 @@ final class runner
             }
 
             if (self::isYamlMappingItem($itemLine)) {
+                // Keys of the item mapping sit at the column after the dash.
+                $keyIndent = $indent + strlen($entry["content"]) - strlen($itemLine);
                 $item = [];
                 [$key, $valuePart] = self::splitYamlKeyValue($itemLine, $entry["line"]);
                 if (isset($entry["block"])) {
                     $item[$key] = $entry["block"];
                 } elseif ($valuePart !== "") {
                     $item[$key] = self::parseYamlScalar($valuePart, $entry["line"]);
-                } elseif (isset($lines[$index]) && $lines[$index]["indent"] > $indent) {
-                    $item[$key] = self::parseYamlNode($lines, $index, $lines[$index]["indent"]);
                 } else {
-                    $item[$key] = null;
+                    $item[$key] = self::parseYamlKeyNode($lines, $index, $keyIndent);
                 }
 
                 if (isset($lines[$index]) && $lines[$index]["indent"] > $indent) {
-                    $extra = self::parseYamlMapping($lines, $index, $lines[$index]["indent"]);
+                    if ($lines[$index]["indent"] !== $keyIndent) {
+                        throw new RuntimeException(
+                            "[divengine.runner] Invalid YAML indentation at line {$lines[$index]["line"]}."
+                        );
+                    }
+                    $extra = self::parseYamlMapping($lines, $index, $keyIndent);
                     foreach ($extra as $extraKey => $extraValue) {
                         if (array_key_exists($extraKey, $item)) {
                             $line = $entry["line"];
@@ -1480,26 +1569,58 @@ final class runner
             return str_replace("''", "'", $unquoted);
         }
 
-        $lower = strtolower($trimmed);
-        if ($lower === "true") {
+        if ($trimmed[0] === '"' || $trimmed[0] === "'") {
+            throw new RuntimeException(
+                "[divengine.runner] Invalid YAML in line {$lineNumber}: unterminated or malformed quoted scalar."
+            );
+        }
+
+        return self::resolveYamlPlainScalar($trimmed);
+    }
+
+    /**
+     * Resolves a plain scalar with the YAML 1.1 rules of PyYAML `safe_load`,
+     * the loader used by `vvm_striders` (so `yes`/`on` are booleans, `0x1F`
+     * and `017` are integers). Timestamps and sexagesimal numbers stay strings.
+     */
+    private static function resolveYamlPlainScalar(string $value): mixed
+    {
+        if (preg_match('/^(?:yes|Yes|YES|true|True|TRUE|on|On|ON)$/', $value) === 1) {
             return true;
         }
-        if ($lower === "false") {
+        if (preg_match('/^(?:no|No|NO|false|False|FALSE|off|Off|OFF)$/', $value) === 1) {
             return false;
         }
-        if ($lower === "null" || $trimmed === "~") {
+        if (preg_match('/^(?:~|null|Null|NULL)$/', $value) === 1) {
             return null;
         }
 
-        if (preg_match('/^-?[0-9]+$/', $trimmed) === 1) {
-            return (int) $trimmed;
+        if (preg_match('/^([-+]?)(0b[01_]+|0x[0-9a-fA-F_]+|0[0-7_]+|0|[1-9][0-9_]*)$/', $value, $m) === 1) {
+            $digits = str_replace("_", "", $m[2]);
+            if (str_starts_with($digits, "0b")) {
+                $number = bindec(substr($digits, 2));
+            } elseif (str_starts_with($digits, "0x")) {
+                $number = hexdec(substr($digits, 2));
+            } elseif (strlen($digits) > 1 && $digits[0] === "0") {
+                $number = octdec(substr($digits, 1));
+            } else {
+                $number = (int) $digits;
+            }
+            $number = is_float($number) ? (int) $number : $number;
+            return $m[1] === "-" ? -$number : $number;
         }
 
-        if (preg_match('/^-?[0-9]+\\.[0-9]+$/', $trimmed) === 1) {
-            return (float) $trimmed;
+        if (preg_match('/^[-+]?(?:[0-9][0-9_]*\\.[0-9_]*|\\.[0-9_]+)(?:[eE][-+][0-9]+)?$/', $value) === 1) {
+            return (float) str_replace("_", "", $value);
+        }
+        if (preg_match('/^([-+]?)\\.(?:inf|Inf|INF)$/', $value, $m) === 1) {
+            return $m[1] === "-" ? -INF : INF;
+        }
+        if (preg_match('/^\\.(?:nan|NaN|NAN)$/', $value) === 1) {
+            return NAN;
         }
 
-        return $trimmed;
+        return $value;
     }
 
     /**
@@ -1585,7 +1706,11 @@ final class runner
                 }
 
                 if ($isMap) {
+                    $keyStart = $position;
                     $key = self::parseYamlFlowValue($text, $position, $lineNumber);
+                    if (!str_contains("\"'[{", $text[$keyStart])) {
+                        $key = trim(substr($text, $keyStart, $position - $keyStart));
+                    }
                     $skip();
                     $value = null;
                     if ($position < $length && $text[$position] === ":") {
@@ -1761,7 +1886,7 @@ final class runner
             if (str_contains($blockId, ".")) {
                 throw new RuntimeException("[divengine.runner] Block id '{$blockId}' cannot contain a dot.");
             }
-            if (in_array("_" . $blockId, self::RESERVED_KEYS, true) || str_starts_with($blockId, "runner_")) {
+            if (str_starts_with($blockId, "_") || in_array("_" . $blockId, self::RESERVED_KEYS, true) || str_starts_with($blockId, "runner_")) {
                 throw new RuntimeException(
                     "[divengine.runner] Block id '{$blockId}' is reserved: its callable key '_{$blockId}' is a runner key."
                 );
@@ -1776,6 +1901,12 @@ final class runner
                 $stepId = trim((string) ($step["id"] ?? ""));
                 if ($stepId === "") {
                     throw new RuntimeException("[divengine.runner] Step id cannot be empty in block '{$blockId}'.");
+                }
+                if (str_starts_with($stepId, "_")) {
+                    throw new RuntimeException(
+                        "[divengine.runner] Step id '{$stepId}' in block '{$blockId}' cannot start with '_': "
+                        . "activity results are stored under the step id and '_' keys are reserved."
+                    );
                 }
                 if (str_contains($stepId, ".")) {
                     throw new RuntimeException(
@@ -2267,67 +2398,52 @@ final class runner
     }
 
     /**
-     * Whether a context key belongs to the scope of the running flow: its
-     * position, call stack and block callables (`_<block_id>` closures).
-     */
-    private static function isScopeKey(string|int $key, mixed $value): bool
-    {
-        if (!is_string($key)) {
-            return false;
-        }
-
-        if (in_array($key, self::SCOPE_KEYS, true)) {
-            return true;
-        }
-
-        return $value instanceof \Closure
-            && str_starts_with($key, "_")
-            && !str_starts_with($key, "__")
-            && !in_array($key, self::SERVICE_KEYS, true);
-    }
-
-    /**
-     * Snapshot of the control keys a nested flow may change.
+     * Context keys of the block callables a generated flow registered.
      *
      * @param array<string, mixed> $context
      *
-     * @return array<string, mixed>
+     * @return array<int, string>
      */
-    private static function controlSnapshot(array $context): array
+    private static function blockKeys(array $context): array
     {
-        $snapshot = [];
-        foreach ($context as $key => $value) {
-            if (self::isScopeKey($key, $value) || in_array($key, self::FLOW_CONTROL_KEYS, true)) {
-                $snapshot[$key] = $value;
+        $blocks = $context["_flow_blocks"] ?? [];
+        if (!is_array($blocks)) {
+            return [];
+        }
+
+        $keys = [];
+        foreach ($blocks as $block) {
+            if (is_string($block) && $block !== "") {
+                $keys[] = "_" . $block;
             }
         }
 
-        return $snapshot;
+        return $keys;
     }
 
     /**
-     * Restores the scope keys (and, unless `$scopeOnly`, also the flow control
-     * keys) from a snapshot, removing the ones the activity added.
+     * Restores the parent's scope after an activity: position, call stack,
+     * the registered block list and every block callable of the parent or of
+     * a nested flow (`_flow_blocks`). Unless `$scopeOnly`, `_flow_state` and
+     * `_autoresume` come back too. Other keys keep what the activity wrote.
      *
      * @param array<string, mixed> $context
-     * @param array<string, mixed> $snapshot
+     * @param array<string, mixed> $snapshot Context as it was before the activity.
      */
     private static function restoreControl(array &$context, array $snapshot, bool $scopeOnly): void
     {
-        $selected = function (string|int $key, mixed $value) use ($scopeOnly): bool {
-            return self::isScopeKey($key, $value)
-                || (!$scopeOnly && in_array($key, self::FLOW_CONTROL_KEYS, true));
-        };
+        $keys = array_merge(
+            self::SCOPE_KEYS,
+            $scopeOnly ? [] : self::FLOW_CONTROL_KEYS,
+            self::blockKeys($snapshot),
+            self::blockKeys($context)
+        );
 
-        foreach ($context as $key => $value) {
-            if ($selected($key, $value)) {
+        foreach (array_unique($keys) as $key) {
+            if (array_key_exists($key, $snapshot)) {
+                $context[$key] = $snapshot[$key];
+            } else {
                 unset($context[$key]);
-            }
-        }
-
-        foreach ($snapshot as $key => $value) {
-            if ($selected($key, $value)) {
-                $context[$key] = $value;
             }
         }
     }

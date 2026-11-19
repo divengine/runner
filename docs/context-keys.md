@@ -33,7 +33,8 @@ This file is the source of truth for context keys reserved by `divengine\runner\
 | `_flow_state` | `array{block?:?string,step_index?:int|null,after_call?:int}` | Runner and wrappers | Internal pointer for resume/jump/call continuation. `after_call` marks a calling step re-entered after its call returned. | Can be preloaded for advanced resume control only. |
 | `_flow_stack` | `array<int, array{block:string,step_index:int}>` | `wrapCall` and `flowLoop` | Return frames of the calls in progress (calling block and step). Persisted with the context so a pause inside a called block resumes back into its caller. | Read-only metadata; keep it when storing a paused context. |
 | `_current_block_id` | `string` | `flowLoop` and `wrapCall` | Block currently executing; default calling block for `wrapCall`. | Trace/debug metadata. |
-| `_max_call_depth` | `int` | User | Maximum nesting of `call` before the run fails (default `runner::MAX_CALL_DEPTH`, 256). | Optional control setting. |
+| `_flow_blocks` | `array<int, string>` | Generated YAML flow runtime | Block ids registered by the running generated flow; scopes nested flows. | Internal; restored after a flow used as an activity. |
+| `_max_call_depth` | `int` | User | Maximum nesting of `call`, and of flows used as activities, before the run fails (default `runner::MAX_CALL_DEPTH`, 256). | Optional control setting. |
 | `_flow_depth` | `int` | `flowLoop` | Nesting level of flows running in this context (a flow used as an activity runs at depth 1+). | Internal; always back to `0` after a run. |
 | `_nested_flow_paused` | `bool` | `flowLoop` / `wrapActivity` | Marks a pause raised inside a nested flow, which ends that nested flow early. | Internal; removed once handled. |
 | `_current_step_id` | `string` | Runner wrappers | Last step id touched by wrappers. | Trace/debug metadata. |
