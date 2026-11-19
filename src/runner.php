@@ -1010,10 +1010,13 @@ final class runner
     /**
      * Converts YAML text into indentation-aware logical lines.
      *
+     * Block scalars (`|`, `>`, with optional `-`/`+` chomping) are read here,
+     * raw, and attached to the line that introduces them as `block`.
+     *
      * @param string $contents
      * @param string $yamlPath
      *
-     * @return array<int, array{indent:int,content:string,line:int}>
+     * @return array<int, array{indent:int,content:string,line:int,block?:string}>
      */
     private static function tokenizeYaml(string $contents, string $yamlPath): array
     {
@@ -1022,22 +1025,14 @@ final class runner
             return [];
         }
 
+        if (isset($rawLines[0]) && str_starts_with($rawLines[0], "\xEF\xBB\xBF")) {
+            $rawLines[0] = substr($rawLines[0], 3);
+        }
+
         $lines = [];
-        foreach ($rawLines as $lineNumber => $rawLine) {
-            if (!is_string($rawLine)) {
-                continue;
-            }
-
-            if ($lineNumber === 0 && str_starts_with($rawLine, "\xEF\xBB\xBF")) {
-                $rawLine = substr($rawLine, 3);
-            }
-
-            if (str_contains($rawLine, "\t")) {
-                $line = $lineNumber + 1;
-                throw new RuntimeException(
-                    "[divengine.runner] Invalid YAML in '{$yamlPath}' line {$line}: tabs are not supported for indentation."
-                );
-            }
+        $count = count($rawLines);
+        for ($lineNumber = 0; $lineNumber < $count; $lineNumber++) {
+            $rawLine = $rawLines[$lineNumber];
 
             $withoutComments = self::stripYamlComments($rawLine);
             $trimmed = trim($withoutComments);
@@ -1045,16 +1040,97 @@ final class runner
                 continue;
             }
 
-            preg_match('/^( *)/', $withoutComments, $matches);
-            $indent = isset($matches[1]) ? strlen($matches[1]) : 0;
-            $lines[] = [
+            preg_match('/^([ \t]*)/', $withoutComments, $matches);
+            if (str_contains($matches[1], "\t")) {
+                $line = $lineNumber + 1;
+                throw new RuntimeException(
+                    "[divengine.runner] Invalid YAML in '{$yamlPath}' line {$line}: tabs are not supported for indentation."
+                );
+            }
+
+            $indent = strlen($matches[1]);
+            $entry = [
                 "indent" => $indent,
-                "content" => ltrim($withoutComments),
+                "content" => rtrim(ltrim($withoutComments)),
                 "line" => $lineNumber + 1,
             ];
+
+            if (preg_match('/(?:^|:\s+|^-\s+)([|>])([-+]?)$/', $entry["content"], $block) === 1) {
+                $blockLines = [];
+                while ($lineNumber + 1 < $count) {
+                    $next = $rawLines[$lineNumber + 1];
+                    if (trim($next) !== "" && strspn($next, " ") <= $indent) {
+                        break;
+                    }
+                    $blockLines[] = $next;
+                    $lineNumber++;
+                }
+                $entry["block"] = self::foldYamlBlock($blockLines, $block[1], $block[2]);
+            }
+
+            $lines[] = $entry;
         }
 
         return $lines;
+    }
+
+    /**
+     * Builds the value of a block scalar from its raw lines.
+     *
+     * @param array<int, string> $rawLines
+     */
+    private static function foldYamlBlock(array $rawLines, string $style, string $chomping): string
+    {
+        $blockIndent = null;
+        foreach ($rawLines as $rawLine) {
+            if (trim($rawLine) !== "") {
+                $blockIndent = strspn($rawLine, " ");
+                break;
+            }
+        }
+
+        $contentLines = [];
+        foreach ($rawLines as $rawLine) {
+            $contentLines[] = $blockIndent === null || trim($rawLine) === ""
+                ? ""
+                : (string) substr($rawLine, $blockIndent);
+        }
+
+        $trailing = 0;
+        for ($i = count($contentLines) - 1; $i >= 0 && $contentLines[$i] === ""; $i--) {
+            $trailing++;
+        }
+        $body = array_slice($contentLines, 0, count($contentLines) - $trailing);
+
+        if ($style === "|") {
+            $text = implode("\n", $body);
+        } else {
+            // Folded: lines of a paragraph are joined by spaces, empty lines and
+            // more-indented lines keep their line breaks.
+            $text = "";
+            $previous = null;
+            foreach ($body as $line) {
+                if ($previous === null) {
+                    $text = $line;
+                } elseif ($line === "" || $previous === "" || $line[0] === " " || $previous[0] === " ") {
+                    $text .= "\n" . $line;
+                } else {
+                    $text .= " " . $line;
+                }
+                $previous = $line;
+            }
+            $text = preg_replace('/\n(?=\n)/', "", $text) ?? $text;
+        }
+
+        if ($body === []) {
+            return $chomping === "+" ? str_repeat("\n", $trailing) : "";
+        }
+
+        return match ($chomping) {
+            "-" => $text,
+            "+" => $text . "\n" . str_repeat("\n", $trailing),
+            default => $text . "\n",
+        };
     }
 
     private static function stripYamlComments(string $line): string
@@ -1095,7 +1171,7 @@ final class runner
                 continue;
             }
 
-            if ($char === "#") {
+            if ($char === "#" && ($i === 0 || $line[$i - 1] === " " || $line[$i - 1] === "\t")) {
                 return rtrim(substr($line, 0, $i));
             }
         }
@@ -1171,8 +1247,13 @@ final class runner
             }
 
             $index++;
+            if (isset($entry["block"])) {
+                $result[$key] = $entry["block"];
+                continue;
+            }
+
             if ($valuePart !== "") {
-                $result[$key] = self::parseYamlScalar($valuePart);
+                $result[$key] = self::parseYamlScalar($valuePart, $entry["line"]);
                 continue;
             }
 
@@ -1228,12 +1309,18 @@ final class runner
                 continue;
             }
 
-            $firstColon = strpos($itemLine, ":");
-            if ($firstColon !== false) {
+            if (isset($entry["block"]) && preg_match('/^[|>][-+]?$/', $itemLine) === 1) {
+                $result[] = $entry["block"];
+                continue;
+            }
+
+            if (self::isYamlMappingItem($itemLine)) {
                 $item = [];
                 [$key, $valuePart] = self::splitYamlKeyValue($itemLine, $entry["line"]);
-                if ($valuePart !== "") {
-                    $item[$key] = self::parseYamlScalar($valuePart);
+                if (isset($entry["block"])) {
+                    $item[$key] = $entry["block"];
+                } elseif ($valuePart !== "") {
+                    $item[$key] = self::parseYamlScalar($valuePart, $entry["line"]);
                 } elseif (isset($lines[$index]) && $lines[$index]["indent"] > $indent) {
                     $item[$key] = self::parseYamlNode($lines, $index, $lines[$index]["indent"]);
                 } else {
@@ -1257,7 +1344,7 @@ final class runner
                 continue;
             }
 
-            $result[] = self::parseYamlScalar($itemLine);
+            $result[] = self::parseYamlScalar($itemLine, $entry["line"]);
         }
 
         return $result;
@@ -1306,7 +1393,17 @@ final class runner
                 continue;
             }
 
+            if ($i + 1 < $length && $line[$i + 1] !== " ") {
+                continue;
+            }
+
             $key = trim(substr($line, 0, $i));
+            if (
+                strlen($key) >= 2
+                && (($key[0] === '"' && str_ends_with($key, '"')) || ($key[0] === "'" && str_ends_with($key, "'")))
+            ) {
+                $key = (string) self::parseYamlScalar($key, $lineNumber);
+            }
             if ($key === "") {
                 throw new RuntimeException(
                     "[divengine.runner] Invalid YAML in line {$lineNumber}: empty mapping key."
@@ -1322,21 +1419,52 @@ final class runner
         );
     }
 
-    private static function parseYamlScalar(string $value): mixed
+    /**
+     * Whether a sequence item such as `key: value` starts a mapping.
+     */
+    private static function isYamlMappingItem(string $itemLine): bool
+    {
+        if ($itemLine === "" || str_contains("[{\"'", $itemLine[0])) {
+            return $itemLine !== "" && ($itemLine[0] === '"' || $itemLine[0] === "'")
+                && preg_match('/^("(?:[^"\\\\]|\\\\.)*"|\'(?:[^\']|\'\')*\'):(\s|$)/', $itemLine) === 1;
+        }
+
+        return preg_match('/:(\s|$)/', $itemLine) === 1;
+    }
+
+    private static function parseYamlScalar(string $value, int $lineNumber = 0): mixed
     {
         $trimmed = trim($value);
         if ($trimmed === "") {
             return "";
         }
 
+        if ($trimmed[0] === "[" || $trimmed[0] === "{") {
+            $position = 0;
+            $parsed = self::parseYamlFlowValue($trimmed, $position, $lineNumber);
+            if (trim(substr($trimmed, $position)) !== "") {
+                throw new RuntimeException(
+                    "[divengine.runner] Invalid YAML in line {$lineNumber}: unexpected content after flow collection."
+                );
+            }
+            return $parsed;
+        }
+
+        if (str_contains("&*!%@`", $trimmed[0])) {
+            throw new RuntimeException(
+                "[divengine.runner] Invalid YAML in line {$lineNumber}: anchors, aliases, tags and reserved indicators "
+                . "are not supported; quote the value."
+            );
+        }
+
         if (
-            (str_starts_with($trimmed, '"') && str_ends_with($trimmed, '"'))
-            || (str_starts_with($trimmed, "'") && str_ends_with($trimmed, "'"))
+            strlen($trimmed) >= 2
+            && ((str_starts_with($trimmed, '"') && str_ends_with($trimmed, '"'))
+            || (str_starts_with($trimmed, "'") && str_ends_with($trimmed, "'")))
         ) {
             $unquoted = substr($trimmed, 1, -1);
             if (str_starts_with($trimmed, '"')) {
-                $decoded = stripcslashes($unquoted);
-                return $decoded;
+                return self::decodeYamlDoubleQuoted($unquoted);
             }
             return str_replace("''", "'", $unquoted);
         }
@@ -1361,6 +1489,152 @@ final class runner
         }
 
         return $trimmed;
+    }
+
+    /**
+     * Decodes the escapes of a YAML double-quoted string.
+     */
+    private static function decodeYamlDoubleQuoted(string $text): string
+    {
+        $map = ["n" => "\n", "t" => "\t", "r" => "\r", "0" => "\0", "\\" => "\\", '"' => '"', "/" => "/", " " => " ",
+            "a" => "\x07", "b" => "\x08", "e" => "\x1B", "f" => "\f", "v" => "\v"];
+
+        return preg_replace_callback(
+            '/\\\\(x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|.)/',
+            function (array $m) use ($map): string {
+                $code = $m[1];
+                if (isset($map[$code])) {
+                    return $map[$code];
+                }
+                if (strlen($code) > 1) {
+                    return self::utf8Chr((int) hexdec(substr($code, 1)));
+                }
+                return "\\" . $code;
+            },
+            $text
+        ) ?? $text;
+    }
+
+    /**
+     * Encodes a Unicode code point as UTF-8 (no mbstring dependency).
+     */
+    private static function utf8Chr(int $code): string
+    {
+        if ($code < 0x80) {
+            return chr($code);
+        }
+        if ($code < 0x800) {
+            return chr(0xC0 | ($code >> 6)) . chr(0x80 | ($code & 0x3F));
+        }
+        if ($code < 0x10000) {
+            return chr(0xE0 | ($code >> 12)) . chr(0x80 | (($code >> 6) & 0x3F)) . chr(0x80 | ($code & 0x3F));
+        }
+        if ($code <= 0x10FFFF) {
+            return chr(0xF0 | ($code >> 18)) . chr(0x80 | (($code >> 12) & 0x3F))
+                . chr(0x80 | (($code >> 6) & 0x3F)) . chr(0x80 | ($code & 0x3F));
+        }
+
+        return "";
+    }
+
+    /**
+     * Parses a one-line flow collection (`[a, b]`, `{k: v}`) or a scalar inside one.
+     */
+    private static function parseYamlFlowValue(string $text, int &$position, int $lineNumber): mixed
+    {
+        $length = strlen($text);
+        $skip = function () use ($text, $length, &$position): void {
+            while ($position < $length && $text[$position] === " ") {
+                $position++;
+            }
+        };
+        $fail = function (string $why) use ($lineNumber): never {
+            throw new RuntimeException("[divengine.runner] Invalid YAML in line {$lineNumber}: {$why}.");
+        };
+
+        $skip();
+        if ($position >= $length) {
+            $fail("unterminated flow collection (multi-line flow collections are not supported)");
+        }
+
+        $char = $text[$position];
+        if ($char === "[" || $char === "{") {
+            $isMap = $char === "{";
+            $close = $isMap ? "}" : "]";
+            $position++;
+            $result = [];
+            while (true) {
+                $skip();
+                if ($position >= $length) {
+                    $fail("unterminated flow collection (multi-line flow collections are not supported)");
+                }
+                if ($text[$position] === $close) {
+                    $position++;
+                    return $result;
+                }
+
+                if ($isMap) {
+                    $key = self::parseYamlFlowValue($text, $position, $lineNumber);
+                    $skip();
+                    $value = null;
+                    if ($position < $length && $text[$position] === ":") {
+                        $position++;
+                        $skip();
+                        if ($position < $length && $text[$position] !== "," && $text[$position] !== "}") {
+                            $value = self::parseYamlFlowValue($text, $position, $lineNumber);
+                        }
+                    }
+                    $result[is_scalar($key) ? (string) $key : ""] = $value;
+                } else {
+                    $result[] = self::parseYamlFlowValue($text, $position, $lineNumber);
+                }
+
+                $skip();
+                if ($position < $length && $text[$position] === ",") {
+                    $position++;
+                    continue;
+                }
+                if ($position < $length && $text[$position] === $close) {
+                    continue;
+                }
+                $fail("expected ',' or '{$close}' in flow collection");
+            }
+        }
+
+        if ($char === '"' || $char === "'") {
+            $end = $position + 1;
+            while ($end < $length) {
+                if ($char === '"' && $text[$end] === "\\") {
+                    $end += 2;
+                    continue;
+                }
+                if ($text[$end] === $char) {
+                    if ($char === "'" && $end + 1 < $length && $text[$end + 1] === "'") {
+                        $end += 2;
+                        continue;
+                    }
+                    break;
+                }
+                $end++;
+            }
+            if ($end >= $length) {
+                $fail("unterminated quoted string");
+            }
+            $quoted = substr($text, $position, $end - $position + 1);
+            $position = $end + 1;
+            return self::parseYamlScalar($quoted, $lineNumber);
+        }
+
+        $start = $position;
+        while ($position < $length) {
+            $c = $text[$position];
+            if ($c === "," || $c === "]" || $c === "}" || ($c === ":" && ($position + 1 >= $length || str_contains(" ,]}", $text[$position + 1])))) {
+                break;
+            }
+            $position++;
+        }
+
+        return self::parseYamlScalar(substr($text, $start, $position - $start), $lineNumber);
     }
 
     /**

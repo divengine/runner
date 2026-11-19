@@ -1,0 +1,18 @@
+id: order
+description: Compute an order total, pause once for review, then print a receipt
+blocks:
+  main:
+    steps:
+      total:
+        activity: compute_total
+      review:
+        call: review.check
+      receipt:
+        activity: format_receipt
+  review:
+    steps:
+      check:
+        condition: needs_review
+        context:
+          reviewed: true
+        pause: true

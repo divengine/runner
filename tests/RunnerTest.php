@@ -1099,6 +1099,76 @@ YAML);
         runner::generateFlowCodeFromYaml($yamlPath);
     }
 
+    public function testYamlParserSupportsBlockScalarsFlowCollectionsAndComments(): void
+    {
+        $context = $this->runTraceFlow(implode("\n", [
+            "blocks:",
+            "  main:",
+            "    steps:",
+            "      s1:",
+            "        context:",
+            "          script: |",
+            "            #!/usr/bin/env bash",
+            "            echo \"a # b\"",
+            "",
+            "            \tindented with tab",
+            "          stripped: |-",
+            "            no newline",
+            "          folded: >",
+            "            one",
+            "            two",
+            "",
+            "            three",
+            "          empty_list: []",
+            "          empty_map: {}",
+            "          list: [a, 'b, c', 3, true, null]",
+            "          map: {x: 1, y: [2, 3], \"z w\": ok}",
+            "          url: http://example.com/#frag # trailing comment",
+            "          \"quoted key\": 'it''s'",
+            "          escaped: \"tab\\there \\u00e9\"",
+            "          items:",
+            "            - |",
+            "              first",
+            "            - name: second",
+            "              body: >-",
+            "                folded item",
+            "",
+        ]));
+
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame("#!/usr/bin/env bash\necho \"a # b\"\n\n\tindented with tab\n", $context["script"]);
+        $this->assertSame("no newline", $context["stripped"]);
+        $this->assertSame("one two\nthree\n", $context["folded"]);
+        $this->assertSame([], $context["empty_list"]);
+        $this->assertSame([], $context["empty_map"]);
+        $this->assertSame(["a", "b, c", 3, true, null], $context["list"]);
+        $this->assertSame(["x" => 1, "y" => [2, 3], "z w" => "ok"], $context["map"]);
+        $this->assertSame("http://example.com/#frag", $context["url"]);
+        $this->assertSame("it's", $context["quoted key"]);
+        $this->assertSame("tab\there é", $context["escaped"]);
+        $this->assertSame(["first\n", ["name" => "second", "body" => "folded item"]], $context["items"]);
+    }
+
+    public function testYamlParserRejectsUnsupportedFeatures(): void
+    {
+        $projectDir = $this->createTempProject();
+        $cases = [
+            "anchor: &a value" => "anchors, aliases, tags",
+            "multi: [a," => "multi-line flow collections are not supported",
+        ];
+
+        foreach ($cases as $line => $expected) {
+            $yamlPath = $projectDir . DIRECTORY_SEPARATOR . md5($line) . ".yml";
+            file_put_contents($yamlPath, "blocks:\n  main:\n    steps:\n      s1:\n        context:\n          {$line}\n");
+            try {
+                runner::generateFlowCodeFromYaml($yamlPath);
+                $this->fail("'{$line}' must be rejected");
+            } catch (RuntimeException $e) {
+                $this->assertStringContainsString($expected, $e->getMessage());
+            }
+        }
+    }
+
     public function testGeneratedCodeIsDeterministic(): void
     {
         $flowPath = __DIR__ . DIRECTORY_SEPARATOR . "flows" . DIRECTORY_SEPARATOR . "business_flow.yml";
