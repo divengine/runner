@@ -1,16 +1,19 @@
 name: PHPStan
 
 on:
+  push:
+    branches: [ "main", "develop" ]
   pull_request:
     branches: [ "main", "develop" ]
   workflow_dispatch:
+  workflow_call:
 
-concurrency:
-  group: phpstan-${{ github.ref }}
-  cancel-in-progress: true
+permissions:
+  contents: read
 
 jobs:
   phpstan:
+    name: phpstan
     runs-on: ubuntu-latest
 
     steps:
@@ -19,14 +22,15 @@ jobs:
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
         with:
-          php-version: "8.3"
+          php-version: "8.1"
           coverage: none
+          tools: composer:v2
 
       - name: Validate composer.json
-        run: composer validate --no-interaction
+        run: composer validate --strict --no-check-lock --no-interaction
 
       - name: Install dependencies
-        run: composer install --no-interaction --prefer-dist --no-progress
+        run: composer update --no-interaction --prefer-dist --no-progress
 
       - name: Run PHPStan
         run: vendor/bin/phpstan analyse -c phpstan.neon --no-progress --memory-limit=1G

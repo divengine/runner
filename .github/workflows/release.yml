@@ -1,111 +1,81 @@
 name: Release
 
+# Releases are created only by pushing a semantic version tag (vMAJOR.MINOR.PATCH)
+# that points to a commit already on main. Pushing code or docs never releases.
 on:
   push:
-    branches: [ "main" ]
-  workflow_dispatch:
+    tags: [ "v[0-9]+.[0-9]+.[0-9]+" ]
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release:
+  verify:
+    name: verify tag
     runs-on: ubuntu-latest
-
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
         with:
-          python-version: "3.11"
+          fetch-depth: 0
 
-      - name: Read composer version
-        id: meta
-        run: |
-          python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          data = json.loads(Path("composer.json").read_text(encoding="utf-8"))
-          version = (data.get("version") or "").strip()
-          if not version:
-              raise SystemExit("composer.json is missing a version field.")
-
-          tag = f"v{version}"
-          out = Path(os.environ["GITHUB_OUTPUT"])
-          out.write_text(f"version={version}\ntag={tag}\n", encoding="utf-8")
-          PY
-
-      - name: Check latest release
-        id: release
+      - name: Validate tag, revision and release notes
+        id: tag
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          python - <<'PY'
-          import json
-          import os
-          import urllib.request
-          from pathlib import Path
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::'$tag' is not a vMAJOR.MINOR.PATCH tag"; exit 1; }
 
-          repo = os.environ["GITHUB_REPOSITORY"]
-          token = os.environ["GITHUB_TOKEN"]
-          tag = os.environ["RELEASE_TAG"]
+          commit="$(git rev-parse "${tag}^{commit}")"
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$commit" origin/main; then
+            echo "::error::$tag ($commit) is not on main"; exit 1
+          fi
 
-          req = urllib.request.Request(
-              f"https://api.github.com/repos/{repo}/releases/latest",
-              headers={
-                  "Authorization": f"Bearer {token}",
-                  "Accept": "application/vnd.github+json",
-                  "X-GitHub-Api-Version": "2022-11-28",
-              },
-          )
+          test -f "releases/${tag}.md" || { echo "::error::missing releases/${tag}.md"; exit 1; }
 
-          latest = ""
-          try:
-              with urllib.request.urlopen(req) as r:
-                  data = json.loads(r.read().decode("utf-8"))
-                  latest = data.get("tag_name", "") or ""
-          except urllib.error.HTTPError as e:
-              if e.code != 404:
-                  raise
+          if jq -e 'has("version")' composer.json >/dev/null; then
+            echo "::error::composer.json must not hardcode a version; Packagist reads it from the tag"; exit 1
+          fi
 
-          should_release = "true" if tag != latest else "false"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $tag already exists"; exit 1
+          fi
 
-          out = Path(os.environ["GITHUB_OUTPUT"])
-          out.write_text(f"latest={latest}\nshould_release={should_release}\n", encoding="utf-8")
-          PY
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag at $commit"
 
-      - name: Require release notes
-        if: steps.release.outputs.should_release == 'true'
-        id: notes
-        env:
-          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
-        run: |
-          python - <<'PY'
-          import os
-          from pathlib import Path
+  tests:
+    needs: verify
+    uses: ./.github/workflows/tests.yml
 
-          version = os.environ["RELEASE_VERSION"]
-          notes = Path("releases") / f"v{version}.md"
+  phpstan:
+    needs: verify
+    uses: ./.github/workflows/phpstan.yml
 
-          if not notes.is_file():
-              raise SystemExit(
-                  f"Missing release notes: {notes}."
-              )
-
-          out = Path(os.environ["GITHUB_OUTPUT"])
-          out.write_text(f"path={notes.as_posix()}\n", encoding="utf-8")
-          PY
+  release:
+    name: github release
+    needs: [ verify, tests, phpstan ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Create GitHub release
-        if: steps.release.outputs.should_release == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          name: Divengine Runner ${{ steps.meta.outputs.version }}
-          body_path: ${{ steps.notes.outputs.path }}
-          fail_on_unmatched_files: false
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Divengine Runner ${TAG#v}" \
+            --notes-file "releases/${TAG}.md"
