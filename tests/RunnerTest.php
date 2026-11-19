@@ -1169,6 +1169,70 @@ YAML);
         }
     }
 
+    public function testFalseConditionSkipsEveryActionOfTheStep(): void
+    {
+        $context = $this->runTraceFlow(<<<YAML
+blocks:
+  main:
+    steps:
+      s1:
+        activity: mark
+      gated:
+        condition: is_false
+        context:
+          gated_context: true
+        call: sub.x1
+        activity: mark
+        jump: main.s1
+        pause: true
+      s3:
+        activity: mark
+  sub:
+    steps:
+      x1:
+        activity: mark
+YAML, null, ["is_false" => "return false;"]);
+
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame(["s1", "s3"], $context["trace"]);
+        $this->assertArrayNotHasKey("gated_context", $context);
+    }
+
+    public function testShortTargetsUseCurrentBlockAndFirstStep(): void
+    {
+        $context = $this->runTraceFlow(<<<YAML
+blocks:
+  main:
+    steps:
+      a:
+        call: other.
+      b:
+        jump: .d
+      c:
+        activity: mark
+      d:
+        activity: mark
+  other:
+    steps:
+      o1:
+        activity: mark
+YAML);
+
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame(["o1", "d"], $context["trace"]);
+    }
+
+    public function testBlockIdsCannotShadowRunnerKeys(): void
+    {
+        $projectDir = $this->createTempProject();
+        $yamlPath = $projectDir . DIRECTORY_SEPARATOR . "reserved.yml";
+        file_put_contents($yamlPath, "blocks:\n  flow_state:\n    steps:\n      s1:\n        pause: true\n");
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage("Block id 'flow_state' is reserved");
+        runner::generateFlowCodeFromYaml($yamlPath);
+    }
+
     public function testGeneratedCodeIsDeterministic(): void
     {
         $flowPath = __DIR__ . DIRECTORY_SEPARATOR . "flows" . DIRECTORY_SEPARATOR . "business_flow.yml";

@@ -65,6 +65,17 @@ final class runner
     private const STEP_KEYS = ["id", "description", "condition", "context", "call", "activity", "jump", "pause"];
 
     /**
+     * Context keys owned by the runner; a block id must not map onto them.
+     */
+    private const RESERVED_KEYS = [
+        "_root_folder", "_logger", "_importer", "_update_context", "_wrap_condition", "_wrap_activity", "_wrap_call",
+        "_wrap_jump", "_wrap_pause", "_check_pause", "_resume_after_call", "__flow_loop", "_exception_pause",
+        "_exception_jump", "_exception_pause_token", "_exception_jump_token", "_flow_state", "_flow_stack",
+        "_flow_depth", "_nested_flow_paused", "_current_block_id", "_current_step_id", "_current_step_index",
+        "_autoresume", "_max_call_depth",
+    ];
+
+    /**
      * Sets a global logger callback used when no per-run logger is provided.
      *
      * @param callable|null $logger
@@ -1749,6 +1760,11 @@ final class runner
             }
             if (str_contains($blockId, ".")) {
                 throw new RuntimeException("[divengine.runner] Block id '{$blockId}' cannot contain a dot.");
+            }
+            if (in_array("_" . $blockId, self::RESERVED_KEYS, true) || str_starts_with($blockId, "runner_")) {
+                throw new RuntimeException(
+                    "[divengine.runner] Block id '{$blockId}' is reserved: its callable key '_{$blockId}' is a runner key."
+                );
             }
             if (isset($blockIds[$blockId])) {
                 throw new RuntimeException("[divengine.runner] Duplicate block id '{$blockId}'.");
