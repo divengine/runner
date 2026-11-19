@@ -67,7 +67,7 @@ Common runtime metadata includes:
 The runner injects helpers into the context for flow control:
 
 - `_wrap_condition`, `_wrap_activity`, `_wrap_call`, `_wrap_jump`, `_wrap_pause`
-- `_check_pause`, `_update_context`
+- `_check_pause`, `_resume_after_call`, `_update_context`
 - `__flow_loop` for block-style execution
 
 These helpers mirror the logic in the original Python runner.
@@ -105,6 +105,14 @@ Flow format notes:
 - `activity` and `condition` values can omit `.php` extension.
 - `call` and `jump` references use `block.step` syntax.
 - `activity` and `condition` are imported as PHP callables through the standard importer.
+
+Control-flow semantics (aligned with the `vvm_strider_jobs` runtime):
+
+- A step runs in this order: condition (false skips the rest of the step), context update, call, activity (its result is stored in `$context[<step_id>]`), jump, pause.
+- `call` runs the target block from the target step and then returns into the calling step, which continues with its activity, jump and pause.
+- `jump` transfers control without returning. The nearest invocation running the target block restarts at the target step; otherwise the target block becomes the running block and pending call continuations are dropped.
+- Blocks do not fall through: the flow ends when the running block returns.
+- `pause` stores the position in `_flow_state`; running the flow again with the same context resumes after the paused step. Pending call return frames are kept in `_flow_stack`, so a pause inside a called block resumes back into its caller. This differs from `vvm_strider_jobs`, where call continuations are not persisted and a resume inside a called block ends the flow when that block returns.
 - YAML parsing is handled internally by runner for flow DSL inputs (no external YAML package at runtime).
 
 Function root precedence during YAML execution:

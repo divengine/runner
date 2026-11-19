@@ -29,7 +29,10 @@ This file is the source of truth for context keys reserved by `divengine\runner\
 | `_wrap_pause` | `callable` | Runner | Wrapper helper for pause control. | Internal helper. |
 | `_check_pause` | `callable` | Runner | Helper that decides whether a step should run after resume. | Internal helper. |
 | `__flow_loop` | `callable` | Runner | Main block-loop runtime entrypoint used by generated flows. | Internal helper. |
-| `_flow_state` | `array{block:?string,step_index:int|null}` | Runner and wrappers | Internal pointer for resume/jump/call continuation. | Can be preloaded for advanced resume control only. |
+| `_resume_after_call` | `callable` | Runner | Helper that tells a calling step it is re-entered after its call returned (resume). | Internal helper. |
+| `_flow_state` | `array{block?:?string,step_index?:int|null,after_call?:int}` | Runner and wrappers | Internal pointer for resume/jump/call continuation. `after_call` marks a calling step re-entered after its call returned. | Can be preloaded for advanced resume control only. |
+| `_flow_stack` | `array<int, array{block:string,step_index:int}>` | `wrapCall` and `flowLoop` | Return frames of the calls in progress (calling block and step). Persisted with the context so a pause inside a called block resumes back into its caller. | Read-only metadata; keep it when storing a paused context. |
+| `_current_block_id` | `string` | `flowLoop` and `wrapCall` | Block currently executing; default calling block for `wrapCall`. | Trace/debug metadata. |
 | `_current_step_id` | `string` | Runner wrappers | Last step id touched by wrappers. | Trace/debug metadata. |
 | `_current_step_index` | `int` | Runner wrappers | Last step index touched by wrappers. | Trace/debug metadata. |
 | `_autoresume` | `bool` | User/flow and runner | If true on pause, runner immediately loops and resumes once. | Optional control flag; runner resets it to `false` after use. |

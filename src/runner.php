@@ -73,7 +73,6 @@ final class runner
         // and only then callable identifiers such as `strlen` or `ns\fn`.
         $callableReference = ltrim($reference, "\\");
 
-
         $candidates = self::buildImportPathCandidates($reference, $context);
         foreach ($candidates as $candidate) {
             if (!is_file($candidate)) {
@@ -137,6 +136,7 @@ final class runner
         $lines[] = "    \$wrapCall = \$context[\"_wrap_call\"] ?? null;";
         $lines[] = "    \$wrapJump = \$context[\"_wrap_jump\"] ?? null;";
         $lines[] = "    \$wrapPause = \$context[\"_wrap_pause\"] ?? null;";
+        $lines[] = "    \$resumeAfterCall = \$context[\"_resume_after_call\"] ?? null;";
         $lines[] = "";
         $lines[] = "    if (";
         $lines[] = "        !is_callable(\$importer)";
@@ -148,6 +148,7 @@ final class runner
         $lines[] = "        || !is_callable(\$wrapCall)";
         $lines[] = "        || !is_callable(\$wrapJump)";
         $lines[] = "        || !is_callable(\$wrapPause)";
+        $lines[] = "        || !is_callable(\$resumeAfterCall)";
         $lines[] = "    ) {";
         $lines[] = "        throw new \\RuntimeException(\"Missing flow helpers in context.\");";
         $lines[] = "    }";
@@ -181,6 +182,7 @@ final class runner
             $lines[] = "        \$wrapCall,";
             $lines[] = "        \$wrapJump,";
             $lines[] = "        \$wrapPause,";
+            $lines[] = "        \$resumeAfterCall,";
             $lines[] = "        \$resolveFunction";
             $lines[] = "    ): mixed {";
 
@@ -194,27 +196,44 @@ final class runner
                 $conditionRef = isset($step["condition"]) && is_string($step["condition"])
                     ? trim($step["condition"])
                     : "";
+                $callRef = isset($step["call"]) && is_string($step["call"]) ? trim($step["call"]) : "";
+                $hasCall = $callRef !== "";
+
+                // A step with a call can be re-entered after the call returns (resume
+                // inside the called block): condition, context update and call already
+                // ran, so only activity, jump and pause remain.
+                if ($hasCall) {
+                    $lines[] = "            \$afterCall = \$resumeAfterCall({$stepIdx}, \$context);";
+                }
+
                 if ($conditionRef !== "") {
                     $conditionRefCode = var_export($conditionRef, true);
-                    $lines[] = "            if (\$wrapCondition(\$resolveFunction({$conditionRefCode}), {$stepIdCode}, {$stepIdx}, \$context)) {";
+                    $guard = $hasCall ? "\$afterCall || " : "";
+                    $lines[] = "            if ({$guard}\$wrapCondition(\$resolveFunction({$conditionRefCode}), {$stepIdCode}, {$stepIdx}, \$context)) {";
                     $indent = "                ";
+                }
+
+                $beforeCallIndent = $indent;
+                if ($hasCall) {
+                    $lines[] = "{$indent}if (!\$afterCall) {";
+                    $beforeCallIndent = $indent . "    ";
                 }
 
                 if (isset($step["context"]) && is_array($step["context"])) {
                     $stepContextCode = var_export($step["context"], true);
-                    $lines[] = "{$indent}\$updateContext(\$context, {$stepContextCode}, {$stepIdCode}, {$stepIdx});";
+                    $lines[] = "{$beforeCallIndent}\$updateContext(\$context, {$stepContextCode}, {$stepIdCode}, {$stepIdx});";
                 }
 
-                $callRef = isset($step["call"]) && is_string($step["call"]) ? trim($step["call"]) : "";
-                if ($callRef !== "") {
+                if ($hasCall) {
                     [$targetBlock, $targetIndex] = self::resolveBlockTarget($callRef, $blockId, $stepIndexMap, "call");
                     $targetCallableKeyCode = var_export("_" . $targetBlock, true);
                     $targetBlockCode = var_export($targetBlock, true);
-                    $lines[] = "{$indent}\$targetCallable = \$context[{$targetCallableKeyCode}] ?? null;";
-                    $lines[] = "{$indent}if (!is_callable(\$targetCallable)) {";
-                    $lines[] = "{$indent}    throw new \\RuntimeException(\"Missing block callable for \" . {$targetCallableKeyCode});";
+                    $lines[] = "{$beforeCallIndent}\$targetCallable = \$context[{$targetCallableKeyCode}] ?? null;";
+                    $lines[] = "{$beforeCallIndent}if (!is_callable(\$targetCallable)) {";
+                    $lines[] = "{$beforeCallIndent}    throw new \\RuntimeException(\"Missing block callable for \" . {$targetCallableKeyCode});";
+                    $lines[] = "{$beforeCallIndent}}";
+                    $lines[] = "{$beforeCallIndent}\$wrapCall(\$targetCallable, {$stepIdCode}, {$stepIdx}, \$context, {$targetBlockCode}, {$targetIndex}, {$blockIdCode});";
                     $lines[] = "{$indent}}";
-                    $lines[] = "{$indent}\$wrapCall(\$targetCallable, {$stepIdCode}, {$stepIdx}, \$context, {$targetBlockCode}, {$targetIndex});";
                 }
 
                 $activityRef = isset($step["activity"]) && is_string($step["activity"])
@@ -361,6 +380,7 @@ final class runner
         $context["_wrap_jump"] = [self::class, "wrapJump"];
         $context["_wrap_pause"] = [self::class, "wrapPause"];
         $context["_check_pause"] = [self::class, "checkPause"];
+        $context["_resume_after_call"] = [self::class, "resumeAfterCall"];
         $context["_exception_pause"] = $pauseToken;
         $context["_exception_jump"] = $jumpToken;
         $context["__flow_loop"] = [self::class, "flowLoop"];
@@ -441,6 +461,18 @@ final class runner
     /**
      * Runs block callables and keeps looping on jump markers.
      *
+     * The block started here is the running block. Blocks do not fall through:
+     * the flow ends when the running block returns and no call continuation is
+     * pending in `_flow_stack`.
+     *
+     * - A jump that escapes the running block restarts at its target. If the
+     *   target block is suspended in `_flow_stack` (a resumed call), the nearest
+     *   such frame becomes the running block again and the frames above it are
+     *   dropped; otherwise every pending call continuation is dropped.
+     * - When the running block returns and `_flow_stack` is not empty, the top
+     *   frame is popped and its calling step continues after the call. This is
+     *   how a pause inside a called block resumes back into its caller.
+     *
      * @param string $initialBlock Initial block key (without leading `_`).
      * @param array  $context        Shared context by reference.
      *
@@ -452,8 +484,6 @@ final class runner
     public static function flowLoop(string $initialBlock, array &$context): mixed
     {
         $tokens = self::ensureTokens($context);
-        $jumpToken = $tokens["jump"];
-        $pauseToken = $tokens["pause"];
 
         self::logContext(
             $context,
@@ -463,9 +493,9 @@ final class runner
 
         while (true) {
             $state = $context["_flow_state"] ?? [];
-            $savedBlock = $state["block"] ?? null;
+            $savedBlock = is_array($state) ? ($state["block"] ?? null) : null;
 
-            if ($savedBlock) {
+            if (is_string($savedBlock) && $savedBlock !== "") {
                 $initialBlock = $savedBlock;
             }
 
@@ -474,19 +504,81 @@ final class runner
                 throw new RuntimeException("Missing block callable for {$key}");
             }
 
+            $context["_current_block_id"] = $initialBlock;
+
             try {
-                return ($context[$key])($context);
+                $result = ($context[$key])($context);
             } catch (Throwable $e) {
-                $message = $e->getMessage();
-                if ($jumpToken !== "" && str_contains($message, $jumpToken)) {
-                    continue;
-                }
-                if ($pauseToken !== "" && str_contains($message, $pauseToken)) {
+                if (!self::isJumpException($e, $tokens)) {
                     throw $e;
                 }
-                throw $e;
+
+                $target = $context["_flow_state"]["block"] ?? null;
+                if ($target !== $initialBlock) {
+                    // Nearest suspended invocation of the target keeps the frames
+                    // below it; without one, all call continuations are dropped.
+                    $stack = self::flowStack($context);
+                    $kept = [];
+                    for ($i = count($stack) - 1; $i >= 0; $i--) {
+                        if ($stack[$i]["block"] === $target) {
+                            $kept = array_slice($stack, 0, $i);
+                            break;
+                        }
+                    }
+                    $context["_flow_stack"] = $kept;
+                }
+                continue;
             }
+
+            $stack = self::flowStack($context);
+            // A frame without a known calling block cannot be resumed.
+            while ($stack !== [] && $stack[count($stack) - 1]["block"] === "") {
+                array_pop($stack);
+                self::logContext($context, "WARNING", "[divengine.runner] Dropped call continuation without a calling block.");
+            }
+
+            if ($stack === []) {
+                $context["_flow_stack"] = [];
+                $context["_flow_state"] = [];
+                return $result;
+            }
+
+            $frame = array_pop($stack);
+            $context["_flow_stack"] = $stack;
+            $context["_flow_state"] = [
+                "block" => $frame["block"],
+                "step_index" => $frame["step_index"] - 1,
+                "after_call" => $frame["step_index"],
+            ];
+
+            self::logContext(
+                $context,
+                "INFO",
+                "[divengine.runner] Returning from call into {$frame["block"]}[{$frame["step_index"]}]"
+            );
         }
+    }
+
+    /**
+     * Tells a step with a call whether it is being re-entered after that call
+     * returned (resume inside the called block). Consumes the marker.
+     *
+     * @param int   $stepIdx Current step index.
+     * @param array $context Shared context by reference.
+     *
+     * @return bool
+     */
+    public static function resumeAfterCall(int $stepIdx, array &$context): bool
+    {
+        $state = $context["_flow_state"] ?? null;
+        if (!is_array($state) || ($state["after_call"] ?? null) !== $stepIdx) {
+            return false;
+        }
+
+        unset($state["after_call"]);
+        $context["_flow_state"] = $state;
+
+        return true;
     }
 
     /**
@@ -582,14 +674,21 @@ final class runner
     }
 
     /**
-     * Wraps a flow call and updates flow state for continuation handling.
+     * Wraps a flow call: runs the target block and returns into the calling step.
      *
-     * @param callable $func
-     * @param string   $stepId
-     * @param int      $stepIdx
-     * @param array    $context
-     * @param string   $call
-     * @param int      $targetIndex
+     * While the call runs, a return frame `{block, step_index}` of the calling
+     * step is kept on `_flow_stack`, so a pause inside the called block can
+     * resume back into the caller. A jump whose target is the called block
+     * restarts it at the target step (nearest invocation); any other jump
+     * unwinds past this call and drops its continuation.
+     *
+     * @param callable    $func
+     * @param string      $stepId
+     * @param int         $stepIdx
+     * @param array       $context
+     * @param string      $call
+     * @param int         $targetIndex
+     * @param string|null $fromBlock Calling block; defaults to `_current_block_id`.
      */
     public static function wrapCall(
         callable $func,
@@ -597,7 +696,8 @@ final class runner
         int $stepIdx,
         array &$context,
         string $call,
-        int $targetIndex
+        int $targetIndex,
+        ?string $fromBlock = null
     ): void {
         self::traceStep("call", self::callableName($func), $stepId, $stepIdx, $context, $call);
         $targetBlock = self::extractBlockTarget($call, self::callableName($func));
@@ -605,8 +705,38 @@ final class runner
             $targetBlock = self::callableName($func);
         }
 
+        $callerBlock = $fromBlock;
+        if ($callerBlock === null && isset($context["_current_block_id"]) && is_string($context["_current_block_id"])) {
+            $callerBlock = $context["_current_block_id"];
+        }
+
+        $stack = self::flowStack($context);
+        $stack[] = ["block" => $callerBlock ?? "", "step_index" => $stepIdx];
+        $context["_flow_stack"] = $stack;
+        $depth = count($stack);
+        $tokens = self::ensureTokens($context);
+
         $context["_flow_state"] = ["block" => $targetBlock, "step_index" => $targetIndex];
-        $func($context);
+
+        while (true) {
+            $context["_current_block_id"] = $targetBlock;
+            try {
+                $func($context);
+                break;
+            } catch (Throwable $e) {
+                if (self::isJumpException($e, $tokens)) {
+                    if (($context["_flow_state"]["block"] ?? null) === $targetBlock) {
+                        continue;
+                    }
+                    $context["_flow_stack"] = array_slice(self::flowStack($context), 0, $depth - 1);
+                }
+                // Pause and errors keep the frame: it is the persisted continuation.
+                throw $e;
+            }
+        }
+
+        $context["_flow_stack"] = array_slice(self::flowStack($context), 0, $depth - 1);
+        $context["_current_block_id"] = $callerBlock;
     }
 
     /**
@@ -1626,6 +1756,43 @@ final class runner
             "pause" => $context[$pauseKey],
             "jump" => $context[$jumpKey],
         ];
+    }
+
+    /**
+     * Returns the call return stack from context, normalized.
+     *
+     * @param array $context
+     *
+     * @return array<int, array{block:string,step_index:int}>
+     */
+    private static function flowStack(array $context): array
+    {
+        $raw = $context["_flow_stack"] ?? [];
+        if (!is_array($raw)) {
+            return [];
+        }
+
+        $stack = [];
+        foreach ($raw as $frame) {
+            if (!is_array($frame)) {
+                continue;
+            }
+            $stack[] = [
+                "block" => is_string($frame["block"] ?? null) ? $frame["block"] : "",
+                "step_index" => is_int($frame["step_index"] ?? null) ? $frame["step_index"] : 0,
+            ];
+        }
+
+        return $stack;
+    }
+
+    /**
+     * @param Throwable                     $e
+     * @param array{pause:string,jump:string} $tokens
+     */
+    private static function isJumpException(Throwable $e, array $tokens): bool
+    {
+        return $tokens["jump"] !== "" && str_contains($e->getMessage(), $tokens["jump"]);
     }
 
     /**

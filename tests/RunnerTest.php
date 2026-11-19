@@ -684,6 +684,278 @@ YAML;
         $this->assertSame("strtoupper", runner::importer("strtoupper", null, ["_root_folder" => $projectDir]));
     }
 
+    public function testCallReturnsIntoCallingStepBeforeItsActivity(): void
+    {
+        $context = $this->runTraceFlow(<<<YAML
+blocks:
+  main:
+    steps:
+      a:
+        activity: mark
+      c:
+        call: sub.s1
+        activity: mark
+      after:
+        activity: mark
+  sub:
+    steps:
+      s1:
+        activity: mark
+      s2:
+        activity: mark
+YAML);
+
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame(["a", "s1", "s2", "c", "after"], $context["trace"]);
+        $this->assertSame([], $context["_flow_stack"]);
+    }
+
+    public function testPauseInsideCalledBlockResumesIntoCaller(): void
+    {
+        $yaml = <<<YAML
+blocks:
+  main:
+    steps:
+      a:
+        activity: mark
+      c:
+        context:
+          marker: from_step
+        call: sub.s1
+        activity: mark
+      after:
+        activity: mark
+  sub:
+    steps:
+      s1:
+        condition: first_time
+        context:
+          marker: from_sub
+        pause: true
+      s2:
+        activity: mark
+YAML;
+
+        $context = $this->runTraceFlow($yaml);
+        $this->assertSame("paused", $context["_runner_state"]);
+        $this->assertSame(["a"], $context["trace"]);
+        $this->assertSame([["block" => "main", "step_index" => 2]], $context["_flow_stack"]);
+
+        $context = $this->runTraceFlow($yaml, $context);
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame(["a", "s2", "c", "after"], $context["trace"]);
+        // The calling step's context update is not re-applied after the call.
+        $this->assertSame("from_sub", $context["marker"]);
+        $this->assertSame([], $context["_flow_stack"]);
+        $this->assertSame([], $context["_flow_state"]);
+    }
+
+    public function testPauseInsideNestedCallsResumesThroughEveryCaller(): void
+    {
+        $yaml = <<<YAML
+blocks:
+  main:
+    steps:
+      m1:
+        call: a.a1
+      m2:
+        activity: mark
+  a:
+    steps:
+      a1:
+        call: b.b1
+      a2:
+        activity: mark
+  b:
+    steps:
+      b1:
+        condition: first_time
+        pause: true
+      b2:
+        activity: mark
+YAML;
+
+        $context = $this->runTraceFlow($yaml);
+        $this->assertSame("paused", $context["_runner_state"]);
+        $this->assertCount(2, $context["_flow_stack"]);
+
+        $context = $this->runTraceFlow($yaml, $context);
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame(["b2", "a2", "m2"], $context["trace"]);
+    }
+
+    public function testAutoresumeInsideCalledBlockReturnsIntoCaller(): void
+    {
+        $context = $this->runTraceFlow(<<<YAML
+blocks:
+  main:
+    steps:
+      c:
+        call: sub.s1
+      after:
+        activity: mark
+  sub:
+    steps:
+      s1:
+        condition: first_time
+        context:
+          _autoresume: true
+        pause: true
+      s2:
+        activity: mark
+YAML);
+
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame(["s2", "after"], $context["trace"]);
+    }
+
+    public function testJumpOutOfCalledBlockDropsCallContinuation(): void
+    {
+        $context = $this->runTraceFlow(<<<YAML
+blocks:
+  main:
+    steps:
+      c:
+        call: sub.s1
+        activity: mark
+      after:
+        activity: mark
+  sub:
+    steps:
+      s1:
+        jump: other.o1
+  other:
+    steps:
+      o1:
+        activity: mark
+YAML);
+
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame(["o1"], $context["trace"]);
+        $this->assertSame([], $context["_flow_stack"]);
+    }
+
+    public function testJumpToCalledBlockRestartsNearestInvocationAndReturns(): void
+    {
+        $context = $this->runTraceFlow(<<<YAML
+blocks:
+  main:
+    steps:
+      c:
+        call: sub.s1
+        activity: mark
+      after:
+        activity: mark
+  sub:
+    steps:
+      s1:
+        activity: mark
+      s2:
+        condition: first_time
+        jump: sub.s1
+      s3:
+        activity: mark
+YAML);
+
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame(["s1", "s1", "s3", "c", "after"], $context["trace"]);
+    }
+
+    public function testJumpToCallerBlockRestartsCallerAtTarget(): void
+    {
+        $context = $this->runTraceFlow(<<<YAML
+blocks:
+  main:
+    steps:
+      c:
+        call: sub.s1
+      after:
+        activity: mark
+      tail:
+        activity: mark
+  sub:
+    steps:
+      s1:
+        jump: main.tail
+      s2:
+        activity: mark
+YAML);
+
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame(["tail"], $context["trace"]);
+    }
+
+    public function testJumpFromResumedCalleeToSuspendedCallerRestartsIt(): void
+    {
+        $yaml = <<<YAML
+blocks:
+  main:
+    steps:
+      c:
+        call: a.a1
+      after:
+        activity: mark
+  a:
+    steps:
+      a1:
+        call: b.b1
+      a2:
+        activity: mark
+      a3:
+        activity: mark
+  b:
+    steps:
+      b1:
+        condition: first_time
+        pause: true
+      b2:
+        jump: a.a3
+YAML;
+
+        $context = $this->runTraceFlow($yaml);
+        $this->assertSame("paused", $context["_runner_state"]);
+
+        $context = $this->runTraceFlow($yaml, $context);
+        $this->assertSame("done", $context["_runner_state"]);
+        // a restarts at a3 and still returns into main.
+        $this->assertSame(["a3", "after"], $context["trace"]);
+    }
+
+    /**
+     * Runs a YAML flow with `mark` (appends the step id to `trace`) and
+     * `first_time` (true once per step id) available as functions.
+     *
+     * @param array<string, mixed>|null $context Context to resume from.
+     *
+     * @return array<string, mixed>
+     */
+    private function runTraceFlow(string $yaml, ?array $context = null): array
+    {
+        if ($context === null) {
+            $projectDir = $this->createTempProject();
+            $this->writeFunctionFile($projectDir, "mark", "\$context['trace'][] = \$context['_current_step_id'];");
+            file_put_contents(
+                $projectDir . DIRECTORY_SEPARATOR . "functions" . DIRECTORY_SEPARATOR . "first_time.php",
+                "<?php\nreturn function (array &\$context): bool {\n"
+                . "    \$key = 'seen_' . \$context['_current_step_id'];\n"
+                . "    if (!empty(\$context[\$key])) { return false; }\n"
+                . "    \$context[\$key] = true;\n"
+                . "    return true;\n"
+                . "};\n"
+            );
+            $context = [
+                "trace" => [],
+                "_root_folder" => $projectDir . DIRECTORY_SEPARATOR . "functions",
+            ];
+        }
+
+        $yamlPath = $context["_root_folder"] . DIRECTORY_SEPARATOR . "flow-" . md5($yaml) . ".yml";
+        file_put_contents($yamlPath, $yaml);
+        runner::run($yamlPath, $context);
+
+        return $context;
+    }
+
     private function createTempProject(): string
     {
         $tempDir = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR)
