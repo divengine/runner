@@ -37,6 +37,9 @@ const EXIT_ERROR = 1;
 const EXIT_USAGE = 2;
 const EXIT_PAUSED = 3;
 
+/** Nesting limit of saved contexts; the same depth `--context` reads back. */
+const JSON_DEPTH = 512;
+
 /** Invocation errors: reported on stderr, exit code 2. */
 final class UsageError extends RuntimeException
 {
@@ -198,7 +201,8 @@ function readContext(string $path): array
         throw new UsageError("cannot read context file: {$path}");
     }
     try {
-        $context = json_decode($json, true, 512, JSON_THROW_ON_ERROR);
+        // json_decode() needs one level more than json_encode() for the same arrays.
+        $context = json_decode($json, true, JSON_DEPTH + 1, JSON_THROW_ON_ERROR);
     } catch (JsonException $e) {
         throw new UsageError("invalid JSON in context file {$path}: " . $e->getMessage());
     }
@@ -206,6 +210,57 @@ function readContext(string $path): array
         throw new UsageError("context file must contain a JSON object: {$path}");
     }
     return $context;
+}
+
+/**
+ * Returns why a value would not come back unchanged from JSON, or null.
+ *
+ * Only null, booleans, integers, floats, strings and arrays of them are
+ * restorable. `json_encode()` turns objects and closures into JSON objects
+ * without error, which would lose them silently, so they are rejected here, as
+ * are resources. The depth limit also stops recursive (reference) arrays.
+ */
+function unrestorableValue(mixed $value, string $path = "context", int $depth = 1): ?string
+{
+    if (is_array($value)) {
+        if ($depth > JSON_DEPTH) {
+            return "{$path}: nested deeper than " . JSON_DEPTH . " levels or recursive";
+        }
+        foreach ($value as $key => $item) {
+            $label = is_int($key) ? (string) $key
+                : (string) json_encode($key, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+            $problem = unrestorableValue($item, "{$path}[{$label}]", $depth + 1);
+            if ($problem !== null) {
+                return $problem;
+            }
+        }
+        return null;
+    }
+    if ($value === null || is_scalar($value)) {
+        return null;
+    }
+    return is_object($value)
+        ? "{$path}: object of class " . get_class($value)
+        : "{$path}: " . get_debug_type($value);
+}
+
+/**
+ * Encodes the context for --save-context and --json.
+ *
+ * @param array<string, mixed> $context
+ *
+ * @throws JsonException When a value cannot be restored or encoded.
+ */
+function encodeContext(array $context): string
+{
+    $problem = unrestorableValue($context);
+    if ($problem !== null) {
+        throw new JsonException("{$problem} cannot be restored from JSON");
+    }
+
+    // Floats keep a fraction (25.0) so they decode as floats on resume.
+    return json_encode($context, JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
+        | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION, JSON_DEPTH) . "\n";
 }
 
 /**
@@ -360,9 +415,7 @@ function main(array $argv): int
     $json = null;
     if ($saveTarget !== null || $options["json"]) {
         try {
-            // Floats keep a fraction (25.0) so they decode as floats on resume.
-            $json = json_encode($context, JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
-                | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION) . "\n";
+            $json = encodeContext($context);
         } catch (JsonException $e) {
             fwrite(STDERR, "runner: flow ended {$state}, but the context is not JSON-serializable: "
                 . $e->getMessage() . "\n");

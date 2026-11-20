@@ -75,6 +75,12 @@ fi
 echo "$actual"
 
 # Command line: pause, then resume from the saved context in a new process.
+# Releases before the bootstrap existed (v0.1.0 from Packagist) skip this part.
+if [[ "$mode" == "packagist" && ! -f "$project/vendor/divengine/runner/bin/run.php" ]]; then
+    echo "cli: skipped, the installed version has no bin/run.php"
+    echo "smoke install OK ($mode)"
+    exit 0
+fi
 cli=(php vendor/divengine/runner/bin/run.php flows/order.yml)
 cd "$project/example"
 ln -s ../vendor vendor

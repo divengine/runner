@@ -44,7 +44,7 @@ configured in the context file:
 | `0` | `done` | The flow finished. |
 | `3` | `paused` | The flow paused and can be resumed. |
 | `1` | `error` | The flow ended in the `error` state (failing step or setup error). |
-| `2` | (empty) | Invocation error: bad arguments or unreadable input (the flow did not run), or the context could not be encoded or saved. |
+| `2` | (empty) | Invocation error: bad arguments or unreadable input (the flow did not run), or the context could not be saved or printed as JSON. |
 
 With `--json`, stdout carries the resulting context instead of the state line;
 the exit code is the same. Diagnostics go to stderr. Output printed by the flow,
@@ -52,9 +52,19 @@ PHP warnings and output left in open buffers are also sent to stderr, so stdout
 only carries the result.
 
 The context is encoded with `json_encode()` and `JSON_PRESERVE_ZERO_FRACTION`,
-so `25.0` stays a float when it is read back. Values that JSON cannot represent
-(closures, objects, resources, invalid UTF-8, `NAN`) make the command fail with
-exit code `2` and a message on stderr. In that case the existing
+so `25.0` stays a float when it is read back. Before encoding, the bootstrap
+checks that every value would come back unchanged: only `null`, booleans,
+integers, floats, strings and arrays of them, at most 512 levels deep. This
+matters because `json_encode()` silently turns objects and closures into JSON
+objects, which would not restore the original values on resume. Objects,
+closures and resources are rejected wherever they are nested; the limit also
+stops recursive (reference) arrays. Values that `json_encode()` itself cannot
+encode (`NAN`, `INF`, invalid UTF-8) fail through `JSON_THROW_ON_ERROR`.
+
+In every such case the command prints a diagnostic on stderr, for example
+`runner: flow ended done, but the context is not JSON-serializable:
+context["data"]["callback"]: object of class Closure cannot be restored from
+JSON`, prints nothing on stdout and exits with code `2`. The existing
 `--save-context` file is not modified.
 
 ## Pause and Resume in the Terminal

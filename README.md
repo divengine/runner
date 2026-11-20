@@ -245,7 +245,7 @@ stays intact.
 | `0` | `done` | The flow finished. |
 | `3` | `paused` | The flow paused; resume it with the saved context. |
 | `1` | `error` | The flow ended in the `error` state: a failing step, or a setup error such as invalid YAML. The message is on stderr. |
-| `2` | (empty) | Invocation error. Either the arguments are bad or an input is missing or unreadable, and the flow did not run. Or the context could not be encoded as JSON or saved; then stderr says how the flow ended and an existing `--save-context` file is left unchanged. |
+| `2` | (empty) | Invocation error. Either the arguments are bad or an input is missing or unreadable, and the flow did not run. Or the context could not be saved or printed as JSON (see below); then stderr says how the flow ended and which value failed, and an existing `--save-context` file is left unchanged. |
 
 **Pause and resume across processes.** Save the context of the first run and
 pass the same file back. Each run is a new PHP process, and steps that already
@@ -261,6 +261,15 @@ done
 $ php -r 'echo json_decode(file_get_contents("state.json"), true)["receipt"], PHP_EOL;'
 Total: 25.00 (reviewed)
 ```
+
+Before `--save-context` or `--json` writes anything, the context is checked to
+contain only values that come back unchanged from JSON: `null`, booleans,
+integers, floats, strings and arrays of them, at most 512 levels deep. Objects
+(closures included) and resources are rejected, even nested inside arrays,
+because `json_encode()` would turn them into plain JSON objects or fail. The same
+happens with values that `json_encode()` cannot encode, such as `NAN` or invalid
+UTF-8. One remaining limitation: an empty JSON object `{}` comes back as an
+empty array `[]`.
 
 `--root` is stored in the context as an absolute path, so the resume run does not
 need it again. On an error, Runner clears the resume state as it does with the

@@ -222,19 +222,107 @@ final class CliTest extends TestCase
         $this->assertStringContainsString("left in an open buffer", $result["stderr"]);
     }
 
-    public function testUnserializableContextFailsVisiblyAndKeepsPreviousFile(): void
+    /**
+     * Values that json_encode() would turn into something else, or cannot encode.
+     *
+     * @return array<string, array{0: string, 1: string, 2: string}>
+     */
+    public static function unrestorableValues(): array
     {
-        $this->writeFile("functions/nan.php", "<?php\nreturn fn (array &\$context): float => NAN;\n");
-        $this->writeFile("flows/nan.yml", "id: nan\nblocks:\n  main:\n    steps:\n      value:\n        activity: nan\n");
+        $values = [
+            "nested object" => ['$value = ["a" => [1, ["when" => new DateTimeImmutable("2026-01-01")]]];',
+                'context["data"]["a"][1]["when"]: object of class DateTimeImmutable'],
+            "plain object" => ['$value = new stdClass();', 'context["data"]: object of class stdClass'],
+            "closure" => ['$value = ["callback" => fn (): int => 1];', 'context["data"]["callback"]: object of class Closure'],
+            "open resource" => ['$value = [fopen("php://memory", "r")];', 'context["data"][0]: resource (stream)'],
+            "closed resource" => ['$handle = fopen("php://memory", "r"); fclose($handle); $value = $handle;',
+                'context["data"]: resource (closed)'],
+            "too deep" => ['$value = "leaf"; for ($i = 0; $i < 512; $i++) { $value = [$value]; }',
+                'nested deeper than 512 levels or recursive'],
+            "recursive array" => ['$value = ["x" => 1]; $value["self"] = &$value;', 'nested deeper than 512 levels or recursive'],
+            "nan" => ['$value = ["ratio" => NAN];', 'Inf and NaN cannot be JSON encoded'],
+            "invalid utf-8" => ['$value = "\xB1\x31";', 'Malformed UTF-8'],
+        ];
+
+        $cases = [];
+        foreach ($values as $name => [$code, $message]) {
+            $cases["{$name}, --save-context"] = [$code, $message, "save"];
+            $cases["{$name}, --json"] = [$code, $message, "json"];
+        }
+
+        return $cases;
+    }
+
+    /**
+     * @dataProvider unrestorableValues
+     */
+    public function testUnrestorableContextFailsVisiblyAndKeepsPreviousFile(string $code, string $message, string $mode): void
+    {
+        $this->writeFile("functions/store.php", "<?php\nreturn function (array &\$context): void {\n    {$code}\n    \$context['data'] = \$value;\n};\n");
+        $this->writeFile("flows/store.yml", "id: store\nblocks:\n  main:\n    steps:\n      store:\n        activity: store\n");
         $this->writeFile("state.json", "{\"previous\": true}\n");
 
-        $result = $this->cli(["flows/nan.yml", "--root", "functions", "--save-context", "state.json"]);
+        $output = $mode === "save" ? ["--save-context", "state.json"] : ["--json"];
+        $result = $this->cli(array_merge(["flows/store.yml", "--root", "functions"], $output));
 
-        $this->assertSame([2, ""], [$result["exit"], $result["stdout"]]);
-        $this->assertStringContainsString("not JSON-serializable", $result["stderr"]);
-        $this->assertStringContainsString("flow ended done", $result["stderr"]);
+        $this->assertSame([2, ""], [$result["exit"], $result["stdout"]], $result["stderr"]);
+        $this->assertStringContainsString("runner: flow ended done, but the context is not JSON-serializable: ", $result["stderr"]);
+        $this->assertStringContainsString($message, $result["stderr"]);
         $this->assertSame("{\"previous\": true}\n", file_get_contents($this->project . "/state.json"));
         $this->assertSame(["flows", "functions", "state.json", "vendor"], $this->projectEntries());
+    }
+
+    /**
+     * The deepest data (context + data + 510 arrays = 512 levels) is saved and
+     * read back with --context; one level more is rejected (see unrestorableValues).
+     */
+    public function testNestedDataArraysRoundTripThroughSavedContext(): void
+    {
+        $this->writeFile("functions/store.php", <<<'PHP'
+            <?php
+            return function (array &$context): void {
+                $deep = "leaf";
+                for ($i = 0; $i < 510; $i++) {
+                    $deep = [$deep];
+                }
+                $context["data"] = [
+                    "int" => 7, "negative" => -3, "float" => 2.0, "fraction" => 0.25, "true" => true,
+                    "false" => false, "null" => null, "text" => "ñandú €", "empty" => [],
+                    "list" => [1, [2, [3, ["four" => 4.0]]]], "sparse" => [3 => "c", 7 => "g"],
+                    "numeric keys" => ["10" => "ten"], "deep" => $deep,
+                ];
+            };
+            PHP);
+        $this->writeFile("flows/store.yml", "id: store
+blocks:
+  main:
+    steps:
+      store:
+        activity: store
+      wait:
+        pause: true
+");
+
+        $first = $this->cli(["flows/store.yml", "--root", "functions", "--save-context", "state.json"]);
+        $this->assertSame(3, $first["exit"], $first["stderr"]);
+        $saved = $this->readJson("state.json", 513)["data"];
+
+        $second = $this->cli(["flows/store.yml", "--context", "state.json", "--json"]);
+        $this->assertSame(0, $second["exit"], $second["stderr"]);
+        $resumed = json_decode($second["stdout"], true, 513, JSON_THROW_ON_ERROR)["data"];
+
+        $deep = "leaf";
+        for ($i = 0; $i < 510; $i++) {
+            $deep = [$deep];
+        }
+        $expected = [
+            "int" => 7, "negative" => -3, "float" => 2.0, "fraction" => 0.25, "true" => true,
+            "false" => false, "null" => null, "text" => "ñandú €", "empty" => [],
+            "list" => [1, [2, [3, ["four" => 4.0]]]], "sparse" => [3 => "c", 7 => "g"],
+            "numeric keys" => [10 => "ten"], "deep" => $deep,
+        ];
+        $this->assertSame($expected, $saved);
+        $this->assertSame($expected, $resumed);
     }
 
     public function testSaveReplacesTheFileAtomicallyWithoutLeftovers(): void
@@ -427,9 +515,9 @@ final class CliTest extends TestCase
     /**
      * @return array<string, mixed>
      */
-    private function readJson(string $relative): array
+    private function readJson(string $relative, int $depth = 512): array
     {
-        $data = json_decode((string) file_get_contents($this->project . "/" . $relative), true, 512, JSON_THROW_ON_ERROR);
+        $data = json_decode((string) file_get_contents($this->project . "/" . $relative), true, $depth, JSON_THROW_ON_ERROR);
         $this->assertIsArray($data);
 
         return $data;
