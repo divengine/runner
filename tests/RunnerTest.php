@@ -302,41 +302,25 @@ YAML;
         $this->assertSame("CONTEXT ROOT", $context["upper_text"] ?? null);
     }
 
-    public function testRunYamlSupportsListBlocksAndStepsSyntax(): void
+    public function testListFormsOfBlocksAndStepsAreRejected(): void
     {
-        $tempDir = $this->createTempProject();
-        $yamlPath = $tempDir . DIRECTORY_SEPARATOR . "flow-list-syntax.yml";
-
-        $yaml = <<<YAML
-id: list-style-flow
-description: list based block and step syntax
-blocks:
-  - id: main
-    steps:
-      - id: sum_step
-        activity: add_values
-      - id: normalize_text
-        activity: uppercase_text
-      - id: end
-        context:
-          flow_result: list_done
-YAML;
-
-        file_put_contents($yamlPath, $yaml);
-
-        $context = [
-            "left" => 2,
-            "right" => 6,
-            "text" => "list syntax",
-            "_root_folder" => __DIR__ . DIRECTORY_SEPARATOR . "activities",
+        $projectDir = $this->createTempProject();
+        $cases = [
+            "blocks:\n  - main:\n      steps: {}\n" => "'blocks' must be a mapping of block id to block",
+            "blocks:\n  main:\n    steps:\n      - s1:\n          pause: true\n" => "'steps' of block 'main' must be a mapping",
+            "blocks:\n  main:\n    id: main\n    steps:\n      s1:\n        id: s1\n" => "unknown key 'id' in block 'main'; unknown key 'id' in step 'main.s1'",
         ];
 
-        runner::run($yamlPath, $context);
-
-        $this->assertSame("done", $context["_runner_state"] ?? null);
-        $this->assertSame(8, $context["sum"] ?? null);
-        $this->assertSame("LIST SYNTAX", $context["upper_text"] ?? null);
-        $this->assertSame("list_done", $context["flow_result"] ?? null);
+        foreach ($cases as $yaml => $expected) {
+            $yamlPath = $projectDir . DIRECTORY_SEPARATOR . md5($yaml) . ".yml";
+            file_put_contents($yamlPath, $yaml);
+            try {
+                runner::generateFlowCodeFromYaml($yamlPath);
+                $this->fail("must be rejected: {$expected}");
+            } catch (RuntimeException $e) {
+                $this->assertStringContainsString($expected, $e->getMessage());
+            }
+        }
     }
 
     public function testFlowLoopHandlesJumpTokenAndContinuesWithSavedBlock(): void
@@ -415,6 +399,8 @@ YAML;
 
         $callable = runner::importer(
             $projectDir . DIRECTORY_SEPARATOR . "missing_fn_" . bin2hex(random_bytes(4)),
+            null,
+            [],
             function (string $level, string $message) use (&$logs): void {
                 $logs[] = [$level, $message];
             }
@@ -514,6 +500,8 @@ YAML;
         $logs = [];
         $callable = runner::importer(
             $brokenPath,
+            null,
+            [],
             function (string $level, string $message, array $context = []) use (&$logs): void {
                 $logs[] = [$level, $message, $context];
             }
@@ -535,6 +523,8 @@ YAML;
         $logs = [];
         $callable = runner::importer(
             $filePath,
+            null,
+            [],
             function (string $level, string $message) use (&$logs): void {
                 $logs[] = [$level, $message];
             }
@@ -573,18 +563,12 @@ YAML;
 
         $called = false;
         $stateDuringCall = null;
-        runner::wrapCall(
-            function (array &$ctx) use (&$called, &$stateDuringCall): void {
-                $called = true;
-                $stateDuringCall = $ctx["_flow_state"];
-                $ctx["call_ran"] = true;
-            },
-            "call",
-            4,
-            $context,
-            "call_target",
-            9
-        );
+        $context["_call_target"] = function (array &$ctx) use (&$called, &$stateDuringCall): void {
+            $called = true;
+            $stateDuringCall = $ctx["_flow_state"];
+            $ctx["call_ran"] = true;
+        };
+        runner::wrapCall("call", 4, $context, "call_target", 9, "main");
         $this->assertTrue($called);
         $this->assertTrue((bool) ($context["call_ran"] ?? false));
         // The called block starts at the target step...
@@ -592,6 +576,7 @@ YAML;
         // ...and an unconsumed pointer does not outlive the call.
         $this->assertSame([], $context["_flow_state"]);
         $this->assertSame([], $context["_flow_stack"]);
+        $this->assertSame("main", $context["_current_block_id"]);
     }
 
     public function testWrapJumpSetsStateAndThrowsJumpToken(): void
@@ -601,21 +586,13 @@ YAML;
         $caught = null;
 
         try {
-            runner::wrapJump(
-                function (array &$ctx): void {
-                },
-                "jump_step",
-                7,
-                $context,
-                "go",
-                11
-            );
+            runner::wrapJump("jump_step", 7, $context, "go", 11);
         } catch (\RuntimeException $e) {
             $caught = $e;
         }
 
         $this->assertNotNull($caught, "wrapJump must throw");
-        $this->assertStringContainsString("Jump to go", $caught->getMessage());
+        $this->assertStringContainsString("Jump to go[11]", $caught->getMessage());
         $this->assertStringContainsString($context["_exception_jump_token"], $caught->getMessage());
 
         $this->assertSame("go", $context["_flow_state"]["block"] ?? null);
@@ -640,14 +617,6 @@ YAML;
 
         $this->assertSame("blockX", $context["_flow_state"]["block"] ?? null);
         $this->assertSame(12, $context["_flow_state"]["step_index"] ?? null);
-    }
-
-    public function testWrapPauseRejectsMissingContextArgument(): void
-    {
-        $this->expectException(RuntimeException::class);
-        $this->expectExceptionMessage("wrapPause requires shared context as the fourth argument");
-
-        runner::wrapPause("blockX", "pause_step", 12);
     }
 
     public function testSafeSerializeHandlesNonSerializableValues(): void
@@ -996,7 +965,7 @@ YAML, null, [], ["child_flow" => $child]);
         $this->assertSame("done", $context["_runner_state"]);
         $this->assertSame(["c1", "t1", "s4"], $context["trace"]);
         $this->assertArrayNotHasKey("_tail", $context);
-        $this->assertSame(0, $context["_flow_depth"]);
+        $this->assertArrayNotHasKey("_flow_depth", $context);
     }
 
     public function testPauseInsideNestedFlowIsAnEarlyReturn(): void
@@ -1286,42 +1255,6 @@ YAML, ["_svc" => fn (): string => "old"], [
         $this->assertSame("Xnew", $context["s2"]);
     }
 
-    public function testLegacyCallWithoutCallingBlockKeepsPreviousResumeBehavior(): void
-    {
-        // Hand-written flow from before `_resume_after_call`: wrapCall without $fromBlock.
-        $flow = function (array &$context): void {
-            $context["_main"] = function (array &$context): void {
-                if ($context["_check_pause"](1, $context)) {
-                    $context["trace"][] = "s1";
-                }
-                if ($context["_check_pause"](2, $context)) {
-                    $context["_wrap_call"]($context["_sub"], "s2", 2, $context, "sub.", 0);
-                }
-                if ($context["_check_pause"](3, $context)) {
-                    $context["trace"][] = "s3";
-                }
-            };
-            $context["_sub"] = function (array &$context): void {
-                if ($context["_check_pause"](1, $context) && empty($context["paused"])) {
-                    $context["paused"] = true;
-                    $context["_wrap_pause"]("sub", "b1", 1, $context);
-                }
-                if ($context["_check_pause"](2, $context)) {
-                    $context["trace"][] = "b2";
-                }
-            };
-            $context["__flow_loop"]("main", $context);
-        };
-
-        $context = ["trace" => []];
-        runner::run($flow, $context);
-        $this->assertSame("paused", $context["_runner_state"]);
-
-        runner::run($flow, $context);
-        $this->assertSame("done", $context["_runner_state"]);
-        $this->assertSame(["s1", "b2"], $context["trace"]);
-    }
-
     public function testIdsStartingWithUnderscoreAreRejected(): void
     {
         $projectDir = $this->createTempProject();
@@ -1349,7 +1282,7 @@ YAML, ["_svc" => fn (): string => "old"], [
 
         $this->assertSame("error", $context["_runner_state"]);
         $this->assertStringContainsString("Nested flow depth exceeds 4", $context["_runner_result"]);
-        $this->assertSame(0, $context["_flow_depth"]);
+        $this->assertArrayNotHasKey("_flow_depth", $context);
     }
 
     public function testContextUpdateKeepsIntegerKeys(): void
@@ -1431,6 +1364,306 @@ YAML, ["_svc" => fn (): string => "old"], [
         $this->assertStringNotContainsString(date("Y-m-d"), $first);
     }
 
+    public function testDeepCallContinuationsResumeFromJsonInFreshProcesses(): void
+    {
+        $yaml = <<<YAML
+blocks:
+  a:
+    steps:
+      a1:
+        activity: mark
+      a2:
+        condition: count_entry
+        call: b.b1
+        activity: mark
+      a3:
+        activity: mark
+      a4:
+        activity: mark
+        pause: true
+      a5:
+        activity: mark
+  b:
+    steps:
+      b1:
+        activity: mark
+      b2:
+        condition: count_entry
+        call: c.c1
+        activity: mark
+      b3:
+        activity: mark
+        pause: true
+      b4:
+        activity: mark
+  c:
+    steps:
+      c1:
+        activity: mark
+      c2:
+        activity: mark
+        pause: true
+      c3:
+        activity: mark
+      c4:
+        activity: mark
+        pause: true
+      c5:
+        activity: mark
+YAML;
+        $project = $this->createProcessProject($yaml, [
+            "count_entry" => "\$context['entries'][\$context['_current_step_id']] = "
+                . "(\$context['entries'][\$context['_current_step_id']] ?? 0) + 1; return true;",
+        ]);
+
+        $runs = [
+            ["paused", ["a1", "b1", "c1", "c2"], [["block" => "a", "step_index" => 2], ["block" => "b", "step_index" => 2]]],
+            ["paused", ["c3", "c4"], [["block" => "a", "step_index" => 2], ["block" => "b", "step_index" => 2]]],
+            ["paused", ["c5", "b2", "b3"], [["block" => "a", "step_index" => 2]]],
+            ["paused", ["b4", "a2", "a3", "a4"], []],
+            ["done", ["a5"], []],
+        ];
+
+        $trace = [];
+        foreach ($runs as $run => [$state, $newSteps, $stack]) {
+            $context = $this->runInFreshProcess($project);
+            $trace = array_merge($trace, $newSteps);
+            $this->assertSame($state, $context["_runner_state"], "run " . ($run + 1));
+            $this->assertSame($trace, $context["trace"], "run " . ($run + 1));
+            $this->assertSame($stack, $context["_flow_stack"], "run " . ($run + 1));
+        }
+
+        // Conditions and calls of the calling steps ran once; nothing ran twice.
+        $this->assertSame(["a2" => 1, "b2" => 1], $context["entries"]);
+        $this->assertSame([], $context["_flow_state"]);
+    }
+
+    public function testRepeatedPauseJumpAndErrorAcrossCallsResumeFromJson(): void
+    {
+        $yaml = <<<YAML
+blocks:
+  a:
+    steps:
+      a1:
+        call: b.b1
+        activity: mark
+      a2:
+        activity: mark
+  b:
+    steps:
+      b1:
+        call: c.c1
+        activity: mark
+      b2:
+        jump: a.a2
+      b3:
+        activity: mark
+  c:
+    steps:
+      c1:
+        activity: mark
+        pause: true
+      c2:
+        condition: first_time
+        jump: c.c1
+      c3:
+        activity: fail_once
+      c4:
+        activity: mark
+YAML;
+        $project = $this->createProcessProject($yaml, [
+            "fail_once" => "if (empty(\$context['failed'])) { \$context['failed'] = true; "
+                . "throw new RuntimeException('boom'); } return null;",
+        ]);
+        $frames = [["block" => "a", "step_index" => 1], ["block" => "b", "step_index" => 1]];
+
+        // Pause inside the innermost called block.
+        $context = $this->runInFreshProcess($project);
+        $this->assertSame("paused", $context["_runner_state"]);
+        $this->assertSame(["c1"], $context["trace"]);
+        $this->assertSame($frames, $context["_flow_stack"]);
+
+        // Resumed, the block jumps to its own first step and pauses there again:
+        // the caller frames stay.
+        $context = $this->runInFreshProcess($project);
+        $this->assertSame("paused", $context["_runner_state"]);
+        $this->assertSame(["c1", "c1"], $context["trace"]);
+        $this->assertSame($frames, $context["_flow_stack"]);
+
+        // An error drops every pending continuation.
+        $context = $this->runInFreshProcess($project);
+        $this->assertSame("error", $context["_runner_state"]);
+        $this->assertStringContainsString("boom", $context["_runner_result"]);
+        $this->assertSame(["c1", "c1"], $context["trace"]);
+        $this->assertSame([], $context["_flow_stack"]);
+
+        // Running again starts the flow from its first block.
+        $context = $this->runInFreshProcess($project);
+        $this->assertSame("paused", $context["_runner_state"]);
+        $this->assertSame(["c1", "c1", "c1"], $context["trace"]);
+        $this->assertSame($frames, $context["_flow_stack"]);
+
+        // Resumed: c finishes, b continues after its call and jumps into the
+        // suspended caller a, which restarts at a2 (a1's activity is dropped).
+        $context = $this->runInFreshProcess($project);
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame(["c1", "c1", "c1", "c4", "b1", "a2"], $context["trace"]);
+        $this->assertSame([], $context["_flow_stack"]);
+        $this->assertSame([], $context["_flow_state"]);
+    }
+
+    public function testContextAfterRunHoldsOnlyData(): void
+    {
+        $yaml = "blocks:\n  main:\n    steps:\n      s1:\n        call: sub.\n  sub:\n    steps:\n"
+            . "      p:\n        pause: true\n      q:\n        activity: mark\n";
+
+        $context = $this->runTraceFlow($yaml);
+        $this->assertSame("paused", $context["_runner_state"]);
+        $this->assertContextHoldsOnlyData($context);
+
+        $context = $this->runTraceFlow($yaml, $context);
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame(["q"], $context["trace"]);
+        $this->assertContextHoldsOnlyData($context);
+        foreach (["_importer", "_logger", "_wrap_call", "__flow_loop", "_main", "_sub", "_flow_blocks"] as $key) {
+            $this->assertArrayNotHasKey($key, $context);
+        }
+    }
+
+    public function testModulesResolveEqualFunctionNamesWithoutCollision(): void
+    {
+        $yaml = <<<YAML
+blocks:
+  main:
+    steps:
+      billing_total:
+        module: billing
+        condition: is_open
+        activity: total
+      shipping_total:
+        module: shipping
+        activity: total
+      plain_total:
+        activity: total
+      tax_total:
+        module: tax
+        activity: total
+      nested_total:
+        module: billing
+        activity: rates/total
+      via_importer:
+        module: billing
+        activity: use_importer
+YAML;
+        $projectDir = $this->createTempProject();
+        $functionsDir = $projectDir . DIRECTORY_SEPARATOR . "functions";
+        $taxDir = $projectDir . DIRECTORY_SEPARATOR . "vendor-tax";
+        $this->writeReturningFunction($functionsDir . "/billing/total.php", "return 'billing';");
+        $this->writeReturningFunction($functionsDir . "/billing/is_open.php", "return true;");
+        $this->writeReturningFunction($functionsDir . "/billing/rates/total.php", "return 'billing rates';");
+        $this->writeReturningFunction(
+            $functionsDir . "/billing/use_importer.php",
+            "return (\$context['_importer'])('total', 'shipping')(\$context) . '+' . (\$context['_importer'])('total')(\$context);"
+        );
+        $this->writeReturningFunction($functionsDir . "/shipping/total.php", "return 'shipping';");
+        $this->writeReturningFunction($functionsDir . "/total.php", "return 'plain';");
+        $this->writeReturningFunction($taxDir . "/total.php", "return 'tax';");
+
+        $yamlPath = $projectDir . DIRECTORY_SEPARATOR . "modules.yml";
+        file_put_contents($yamlPath, $yaml);
+        $context = ["_root_folder" => $functionsDir, "_modules" => ["tax" => $taxDir]];
+        runner::run($yamlPath, $context);
+
+        $this->assertSame("done", $context["_runner_state"], (string) $context["_runner_result"]);
+        $this->assertSame("billing", $context["billing_total"]);
+        $this->assertSame("shipping", $context["shipping_total"]);
+        $this->assertSame("plain", $context["plain_total"]);
+        $this->assertSame("tax", $context["tax_total"]);
+        $this->assertSame("billing rates", $context["nested_total"]);
+        $this->assertSame("shipping+plain", $context["via_importer"]);
+
+        $empty = [];
+        $billing = runner::importer("total", "billing", ["_root_folder" => $functionsDir]);
+        $tax = runner::importer("total.php", "tax", ["_modules" => ["tax" => $taxDir]]);
+        $this->assertIsCallable($billing);
+        $this->assertIsCallable($tax);
+        $this->assertSame("billing", $billing($empty));
+        $this->assertSame("tax", $tax($empty));
+    }
+
+    public function testModuleReferenceNeverFallsBackOutsideItsModule(): void
+    {
+        $projectDir = $this->createTempProject();
+        $functionsDir = $projectDir . DIRECTORY_SEPARATOR . "functions";
+        $this->writeReturningFunction($functionsDir . "/plain_only.php", "return 'plain';");
+        $yamlPath = $projectDir . DIRECTORY_SEPARATOR . "missing.yml";
+        file_put_contents($yamlPath, "blocks:\n  main:\n    steps:\n      s1:\n        module: billing\n        activity: plain_only\n");
+
+        $context = ["_root_folder" => $functionsDir];
+        runner::run($yamlPath, $context);
+
+        $this->assertSame("error", $context["_runner_state"]);
+        $this->assertStringContainsString("Function import failed: billing:plain_only", $context["_runner_result"]);
+        $logs = implode("\n", array_column($context["_runner_logs"], "message"));
+        $this->assertStringContainsString("Import target not found or not callable: billing:plain_only", $logs);
+
+        // Callable names and paths are unqualified references only.
+        $this->assertNull(runner::importer("strlen", "billing", ["_root_folder" => $functionsDir]));
+        $this->assertNull(runner::importer($functionsDir . "/plain_only.php", "billing", ["_root_folder" => $functionsDir]));
+        $this->assertNull(runner::importer("../plain_only", "billing", ["_root_folder" => $functionsDir]));
+        $this->assertNull(runner::importer("plain_only", "../functions", ["_root_folder" => $functionsDir]));
+    }
+
+    public function testModuleReferencesAreValidatedAtCompileTime(): void
+    {
+        $projectDir = $this->createTempProject();
+        $step = "blocks:\n  main:\n    steps:\n      s1:\n";
+        $cases = [
+            $step . "        module: ../billing\n        activity: total\n" => "module name '../billing' must use letters",
+            $step . "        module: billing\n        activity: ../total\n" => "function '../total' of module 'billing' must be a relative name",
+            $step . "        module: billing\n        condition: /abs/check\n" => "function '/abs/check' of module 'billing' must be a relative name",
+            $step . "        module: billing\n        pause: true\n" => "'module' in step 'main.s1' needs an 'activity' or a 'condition'",
+            $step . "        module: 5\n        activity: total\n" => "'module' in step 'main.s1' must be a non-empty string",
+        ];
+
+        foreach ($cases as $yaml => $expected) {
+            $yamlPath = $projectDir . DIRECTORY_SEPARATOR . md5($yaml) . ".yml";
+            file_put_contents($yamlPath, $yaml);
+            try {
+                runner::generateFlowCodeFromYaml($yamlPath);
+                $this->fail("must be rejected: {$expected}");
+            } catch (RuntimeException $e) {
+                $this->assertStringContainsString($expected, $e->getMessage());
+            }
+        }
+    }
+
+    public function testFunctionMapUsesQualifiedNames(): void
+    {
+        $projectDir = $this->createTempProject();
+        $functionsDir = $projectDir . DIRECTORY_SEPARATOR . "functions";
+        $this->writeReturningFunction($functionsDir . "/billing/total.php", "return 'billing';");
+        $this->writeReturningFunction($functionsDir . "/shipping/total.php", "return 'shipping';");
+        $this->writeReturningFunction($functionsDir . "/total.php", "return 'plain';");
+        $yamlPath = $projectDir . DIRECTORY_SEPARATOR . "mapped.yml";
+        file_put_contents($yamlPath, "blocks:\n  main:\n    steps:\n"
+            . "      a:\n        module: billing\n        activity: total\n"
+            . "      b:\n        activity: total\n"
+            . "      c:\n        module: shipping\n        activity: total\n");
+
+        $context = ["_root_folder" => $functionsDir];
+        runner::runYaml($yamlPath, $context, ["function_map" => [
+            "billing:total" => "shipping:total",
+            "total" => "billing:total",
+            "shipping:total" => "total",
+        ]]);
+
+        $this->assertSame("done", $context["_runner_state"], (string) $context["_runner_result"]);
+        $this->assertSame("shipping", $context["a"]);
+        $this->assertSame("billing", $context["b"]);
+        $this->assertSame("plain", $context["c"]);
+    }
+
     /**
      * Runs a YAML flow with `mark` (appends the step id to `trace`) and
      * `first_time` (true once per step id) available as functions.
@@ -1472,6 +1705,77 @@ YAML, ["_svc" => fn (): string => "old"], [
         runner::run($yamlPath, $context);
 
         return $context;
+    }
+
+    /**
+     * A project whose flow runs in a separate PHP process per run, with the
+     * context stored as JSON between runs (`context.json`).
+     *
+     * @param array<string, string> $functions Extra functions: name => body returning a value.
+     *
+     * @return array{flow:string,context:string,script:string}
+     */
+    private function createProcessProject(string $yaml, array $functions = []): array
+    {
+        $projectDir = $this->createTempProject();
+        $functionsDir = $projectDir . DIRECTORY_SEPARATOR . "functions";
+        $functions["mark"] = "\$context['trace'][] = \$context['_current_step_id']; return null;";
+        $functions["first_time"] = "\$key = 'seen_' . \$context['_current_step_id']; "
+            . "if (!empty(\$context[\$key])) { return false; } \$context[\$key] = true; return true;";
+        foreach ($functions as $name => $body) {
+            $this->writeReturningFunction($functionsDir . DIRECTORY_SEPARATOR . $name . ".php", $body);
+        }
+
+        $project = [
+            "flow" => $projectDir . DIRECTORY_SEPARATOR . "flow.yml",
+            "context" => $projectDir . DIRECTORY_SEPARATOR . "context.json",
+            "script" => $projectDir . DIRECTORY_SEPARATOR . "run.php",
+        ];
+        file_put_contents($project["flow"], $yaml);
+        file_put_contents($project["context"], json_encode(["trace" => [], "_root_folder" => $functionsDir]));
+        file_put_contents($project["script"], "<?php\n"
+            . "require " . var_export(dirname(__DIR__) . "/vendor/autoload.php", true) . ";\n"
+            . "\$context = json_decode(file_get_contents(\$argv[2]), true, 512, JSON_THROW_ON_ERROR);\n"
+            . "divengine\\runner\\runner::run(\$argv[1], \$context);\n"
+            . "file_put_contents(\$argv[2], json_encode(\$context, JSON_THROW_ON_ERROR));\n");
+
+        return $project;
+    }
+
+    /**
+     * @param array{flow:string,context:string,script:string} $project
+     *
+     * @return array<string, mixed>
+     */
+    private function runInFreshProcess(array $project): array
+    {
+        $command = implode(" ", array_map("escapeshellarg", [PHP_BINARY, $project["script"], $project["flow"], $project["context"]]));
+        exec($command . " 2>&1", $output, $exitCode);
+        $this->assertSame(0, $exitCode, implode("\n", $output));
+
+        $context = json_decode((string) file_get_contents($project["context"]), true, 512, JSON_THROW_ON_ERROR);
+        $this->assertIsArray($context);
+
+        return $context;
+    }
+
+    /**
+     * @param array<mixed> $context
+     */
+    private function assertContextHoldsOnlyData(array $context): void
+    {
+        array_walk_recursive($context, function (mixed $value, int|string $key): void {
+            $this->assertFalse(is_object($value) || is_resource($value), "non-data value under '{$key}'");
+        });
+        $this->assertSame($context, json_decode(json_encode($context, JSON_THROW_ON_ERROR), true));
+    }
+
+    private function writeReturningFunction(string $path, string $body): void
+    {
+        if (!is_dir(dirname($path))) {
+            mkdir(dirname($path), 0777, true);
+        }
+        file_put_contents($path, "<?php\nreturn function (array &\$context): mixed {\n    {$body}\n};\n");
     }
 
     private function createTempProject(): string

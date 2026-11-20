@@ -56,8 +56,21 @@ final class runner
      * Keys accepted in a YAML flow definition (root, block and step level).
      */
     private const FLOW_KEYS = ["id", "description", "blocks"];
-    private const BLOCK_KEYS = ["id", "description", "steps"];
-    private const STEP_KEYS = ["id", "description", "condition", "context", "call", "activity", "jump", "pause"];
+    private const BLOCK_KEYS = ["description", "steps"];
+    private const STEP_KEYS = ["description", "module", "condition", "context", "call", "activity", "jump", "pause"];
+
+    /**
+     * Module names: letters, digits, `_` and `-`, not starting with `-`.
+     */
+    private const MODULE_PATTERN = '/^[A-Za-z0-9_][A-Za-z0-9_-]*$/';
+
+    /**
+     * Helpers the runner puts in the context for the duration of a run.
+     */
+    private const HELPER_KEYS = [
+        "_logger", "_importer", "_update_context", "_wrap_condition", "_wrap_activity", "_wrap_call", "_wrap_jump",
+        "_wrap_pause", "_check_pause", "_resume_after_call", "__flow_loop",
+    ];
 
     /**
      * Context keys owned by the runner; a block id must not map onto them.
@@ -67,7 +80,7 @@ final class runner
         "_wrap_jump", "_wrap_pause", "_check_pause", "_resume_after_call", "__flow_loop", "_exception_pause",
         "_exception_jump", "_exception_pause_token", "_exception_jump_token", "_flow_state", "_flow_stack",
         "_flow_depth", "_nested_flow_paused", "_current_block_id", "_current_step_id", "_current_step_index",
-        "_autoresume", "_max_call_depth", "_flow_blocks",
+        "_autoresume", "_max_call_depth", "_flow_blocks", "_modules",
     ];
 
     /**
@@ -81,32 +94,54 @@ final class runner
     }
 
     /**
-     * Imports a callable from file path or callable identifier.
+     * Imports a function by name, optionally from a module.
      *
-     * File resolution happens at runtime using `_root_folder` from context
-     * (if present), otherwise `DIV_RUNNER_ROOT_FOLDER`.
+     * Without a module, `$name` resolves to the first match of:
+     * 1. `<root>/<name>.php`, where root is `_root_folder` from `$context`, else `DIV_RUNNER_ROOT_FOLDER`;
+     * 2. `<name>.php` as a path (absolute or relative to the working directory);
+     * 3. a callable name such as `strlen` or `vendor\package\fn`.
      *
-     * @param string              $path
-     * @param callable|null       $logger
-     * @param array<string, mixed> $context
+     * With a module, `$name` resolves only to `<module folder>/<name>.php`, where the
+     * module folder is `_modules[<module>]` from `$context`, else `<root>/<module>`.
+     * Nothing outside the module folder is tried, so equal function names in
+     * different modules never collide. Inside a module, `$name` is a relative
+     * name (`compute`, `tax/compute`) without `.` or `..` segments.
      *
-     * @return callable|null
+     * The `.php` extension is optional; a file must return a callable.
+     *
+     * @param string               $name    Function name, path or callable name.
+     * @param string|null          $module  Module name, or null for an unqualified reference.
+     * @param array<string, mixed> $context Context read for `_root_folder` and `_modules`.
+     * @param callable|null        $logger  Defaults to the logger set with `setLogger()`.
+     *
+     * @return callable|null Null, with an error logged, when nothing resolves.
      */
-    public static function importer(string $path, ?callable $logger = null, array $context = []): ?callable
-    {
+    public static function importer(
+        string $name,
+        ?string $module = null,
+        array $context = [],
+        ?callable $logger = null
+    ): ?callable {
         $logger = $logger ?? self::$loggerSink;
 
-        $reference = trim($path);
+        $reference = trim($name);
         if ($reference === "") {
-            self::emitLog($logger, "ERROR", "Import path is empty.");
+            self::emitLog($logger, "ERROR", "Import name is empty.");
             return null;
         }
 
-        // Resolution order: PHP files first (root folder, then the raw path),
-        // and only then callable identifiers such as `strlen` or `ns\fn`.
-        $callableReference = ltrim($reference, "\\");
+        if ($module !== null) {
+            $problem = self::moduleReferenceProblem($module, $reference);
+            if ($problem !== null) {
+                self::emitLog($logger, "ERROR", "Invalid module reference: {$problem}");
+                return null;
+            }
+            $folder = self::resolveModuleFolder($module, $context);
+            $candidates = [self::ensurePhpExtension(self::joinPath($folder, $reference))];
+        } else {
+            $candidates = self::buildImportPathCandidates($reference, $context);
+        }
 
-        $candidates = self::buildImportPathCandidates($reference, $context);
         foreach ($candidates as $candidate) {
             if (!is_file($candidate)) {
                 continue;
@@ -129,19 +164,27 @@ final class runner
             return $func;
         }
 
-        if (is_callable($callableReference)) {
+        $callableReference = ltrim($reference, "\\");
+        if ($module === null && is_callable($callableReference)) {
             return $callableReference;
         }
 
-        self::emitLog($logger, "ERROR", "Import target not found or not callable: {$reference}");
+        $label = self::qualifiedName($reference, $module);
+        self::emitLog($logger, "ERROR", "Import target not found or not callable: {$label}");
         return null;
     }
 
     /**
-     * Generates PHP closure code from a YAML flow file.
+     * Generates the PHP source of a flow closure from a YAML flow file.
      *
-     * @param string $yamlPath
-     * @param array  $options
+     * The output is deterministic and is a valid flow file body (prefix it with
+     * `<?php`). Options:
+     * - `function_map`: `["<qualified name>" => "<qualified name>"]` renames
+     *   activity and condition references at compile time. A qualified name is
+     *   `module:name` for a step with a `module`, else the plain name.
+     *
+     * @param string               $yamlPath
+     * @param array<string, mixed> $options
      *
      * @return string
      */
@@ -154,49 +197,36 @@ final class runner
 
         $initialBlock = $blocks[0]["id"];
         $stepIndexMap = self::buildStepIndexMap($blocks);
-        $functionMap = isset($options["function_map"]) && is_array($options["function_map"])
-            ? $options["function_map"]
-            : [];
+        $functionMap = self::normalizeFunctionMap($options["function_map"] ?? []);
+
+        $helpers = [
+            "flowLoop" => "__flow_loop",
+            "importer" => "_importer",
+            "checkPause" => "_check_pause",
+            "updateContext" => "_update_context",
+            "wrapCondition" => "_wrap_condition",
+            "wrapActivity" => "_wrap_activity",
+            "wrapCall" => "_wrap_call",
+            "wrapJump" => "_wrap_jump",
+            "wrapPause" => "_wrap_pause",
+            "resumeAfterCall" => "_resume_after_call",
+        ];
 
         $lines = [];
-        $functionMapCode = var_export($functionMap, true);
         $lines[] = "return function (array &\$context): void {";
-        $lines[] = "    \$importer = \$context[\"_importer\"] ?? null;";
-        $lines[] = "    \$flowLoop = \$context[\"__flow_loop\"] ?? null;";
-        $lines[] = "    \$checkPause = \$context[\"_check_pause\"] ?? null;";
-        $lines[] = "    \$updateContext = \$context[\"_update_context\"] ?? null;";
-        $lines[] = "    \$wrapCondition = \$context[\"_wrap_condition\"] ?? null;";
-        $lines[] = "    \$wrapActivity = \$context[\"_wrap_activity\"] ?? null;";
-        $lines[] = "    \$wrapCall = \$context[\"_wrap_call\"] ?? null;";
-        $lines[] = "    \$wrapJump = \$context[\"_wrap_jump\"] ?? null;";
-        $lines[] = "    \$wrapPause = \$context[\"_wrap_pause\"] ?? null;";
-        $lines[] = "    \$resumeAfterCall = \$context[\"_resume_after_call\"] ?? null;";
+        foreach ($helpers as $variable => $key) {
+            $lines[] = "    \${$variable} = \$context[\"{$key}\"] ?? null;";
+        }
         $lines[] = "";
-        $lines[] = "    if (";
-        $lines[] = "        !is_callable(\$importer)";
-        $lines[] = "        || !is_callable(\$flowLoop)";
-        $lines[] = "        || !is_callable(\$checkPause)";
-        $lines[] = "        || !is_callable(\$updateContext)";
-        $lines[] = "        || !is_callable(\$wrapCondition)";
-        $lines[] = "        || !is_callable(\$wrapActivity)";
-        $lines[] = "        || !is_callable(\$wrapCall)";
-        $lines[] = "        || !is_callable(\$wrapJump)";
-        $lines[] = "        || !is_callable(\$wrapPause)";
-        $lines[] = "        || !is_callable(\$resumeAfterCall)";
-        $lines[] = "    ) {";
-        $lines[] = "        throw new \\RuntimeException(\"Missing flow helpers in context.\");";
+        $checks = array_map(fn (string $variable): string => "!is_callable(\${$variable})", array_keys($helpers));
+        $lines[] = "    if (" . implode(" || ", $checks) . ") {";
+        $lines[] = "        throw new \\RuntimeException(\"Missing flow helpers in context: run this flow with runner::run().\");";
         $lines[] = "    }";
         $lines[] = "";
-        $lines[] = "    \$functionMap = {$functionMapCode};";
-        $lines[] = "    \$resolveFunction = function (string \$reference) use (\$importer, \$functionMap): callable {";
-        $lines[] = "        \$mapped = \$reference;";
-        $lines[] = "        if (isset(\$functionMap[\$reference]) && is_string(\$functionMap[\$reference]) && trim(\$functionMap[\$reference]) !== \"\") {";
-        $lines[] = "            \$mapped = trim(\$functionMap[\$reference]);";
-        $lines[] = "        }";
-        $lines[] = "";
-        $lines[] = "        \$callable = \$importer(\$mapped);";
+        $lines[] = "    \$resolveFunction = function (string \$name, ?string \$module) use (\$importer): callable {";
+        $lines[] = "        \$callable = \$importer(\$name, \$module);";
         $lines[] = "        if (!is_callable(\$callable)) {";
-        $lines[] = "            throw new \\RuntimeException(\"Function import failed: \" . \$reference);";
+        $lines[] = "            throw new \\RuntimeException(\"Function import failed: \" . (\$module === null ? \$name : \$module . \":\" . \$name));";
         $lines[] = "        }";
         $lines[] = "";
         $lines[] = "        return \$callable;";
@@ -212,21 +242,14 @@ final class runner
             $contextBlockKeyCode = var_export("_" . $blockId, true);
             $lines[] = "";
             $lines[] = "    \$context[{$contextBlockKeyCode}] = function (array &\$context) use (";
-            $lines[] = "        \$checkPause,";
-            $lines[] = "        \$updateContext,";
-            $lines[] = "        \$wrapCondition,";
-            $lines[] = "        \$wrapActivity,";
-            $lines[] = "        \$wrapCall,";
-            $lines[] = "        \$wrapJump,";
-            $lines[] = "        \$wrapPause,";
-            $lines[] = "        \$resumeAfterCall,";
-            $lines[] = "        \$resolveFunction";
-            $lines[] = "    ): mixed {";
+            $lines[] = "        \$checkPause, \$updateContext, \$wrapCondition, \$wrapActivity, \$wrapCall, \$wrapJump, \$wrapPause,";
+            $lines[] = "        \$resumeAfterCall, \$resolveFunction";
+            $lines[] = "    ): void {";
 
-            $steps = $block["steps"];
-            foreach ($steps as $stepPosition => $step) {
+            foreach ($block["steps"] as $stepPosition => $step) {
                 $stepIdx = $stepPosition + 1;
                 $stepIdCode = var_export($step["id"], true);
+                $module = isset($step["module"]) && is_string($step["module"]) ? trim($step["module"]) : null;
                 $lines[] = "        if (\$checkPause({$stepIdx}, \$context)) {";
                 $indent = "            ";
 
@@ -236,17 +259,17 @@ final class runner
                 $callRef = isset($step["call"]) && is_string($step["call"]) ? trim($step["call"]) : "";
                 $hasCall = $callRef !== "";
 
-                // A step with a call can be re-entered after the call returns (resume
-                // inside the called block): condition, context update and call already
-                // ran, so only activity, jump and pause remain.
+                // A step with a call is re-entered after the call returns from a
+                // resumed pause: condition, context update and call already ran,
+                // so only activity, jump and pause remain.
                 if ($hasCall) {
                     $lines[] = "            \$afterCall = \$resumeAfterCall({$stepIdx}, \$context);";
                 }
 
                 if ($conditionRef !== "") {
-                    $conditionRefCode = var_export($conditionRef, true);
+                    $resolveCode = self::resolveFunctionCode($conditionRef, $module, $functionMap);
                     $guard = $hasCall ? "\$afterCall || " : "";
-                    $lines[] = "            if ({$guard}\$wrapCondition(\$resolveFunction({$conditionRefCode}), {$stepIdCode}, {$stepIdx}, \$context)) {";
+                    $lines[] = "            if ({$guard}\$wrapCondition({$resolveCode}, {$stepIdCode}, {$stepIdx}, \$context)) {";
                     $indent = "                ";
                 }
 
@@ -263,13 +286,8 @@ final class runner
 
                 if ($hasCall) {
                     [$targetBlock, $targetIndex] = self::resolveBlockTarget($callRef, $blockId, $stepIndexMap, "call");
-                    $targetCallableKeyCode = var_export("_" . $targetBlock, true);
                     $targetBlockCode = var_export($targetBlock, true);
-                    $lines[] = "{$beforeCallIndent}\$targetCallable = \$context[{$targetCallableKeyCode}] ?? null;";
-                    $lines[] = "{$beforeCallIndent}if (!is_callable(\$targetCallable)) {";
-                    $lines[] = "{$beforeCallIndent}    throw new \\RuntimeException(\"Missing block callable for \" . {$targetCallableKeyCode});";
-                    $lines[] = "{$beforeCallIndent}}";
-                    $lines[] = "{$beforeCallIndent}\$wrapCall(\$targetCallable, {$stepIdCode}, {$stepIdx}, \$context, {$targetBlockCode}, {$targetIndex}, {$blockIdCode});";
+                    $lines[] = "{$beforeCallIndent}\$wrapCall({$stepIdCode}, {$stepIdx}, \$context, {$targetBlockCode}, {$targetIndex}, {$blockIdCode});";
                     $lines[] = "{$indent}}";
                 }
 
@@ -277,24 +295,18 @@ final class runner
                     ? trim($step["activity"])
                     : "";
                 if ($activityRef !== "") {
-                    $activityRefCode = var_export($activityRef, true);
-                    $lines[] = "{$indent}\$wrapActivity(\$resolveFunction({$activityRefCode}), {$stepIdCode}, {$stepIdx}, \$context);";
+                    $resolveCode = self::resolveFunctionCode($activityRef, $module, $functionMap);
+                    $lines[] = "{$indent}\$wrapActivity({$resolveCode}, {$stepIdCode}, {$stepIdx}, \$context);";
                 }
 
                 $jumpRef = isset($step["jump"]) && is_string($step["jump"]) ? trim($step["jump"]) : "";
                 if ($jumpRef !== "") {
                     [$targetBlock, $targetIndex] = self::resolveBlockTarget($jumpRef, $blockId, $stepIndexMap, "jump");
-                    $targetCallableKeyCode = var_export("_" . $targetBlock, true);
                     $targetBlockCode = var_export($targetBlock, true);
-                    $lines[] = "{$indent}\$targetCallable = \$context[{$targetCallableKeyCode}] ?? null;";
-                    $lines[] = "{$indent}if (!is_callable(\$targetCallable)) {";
-                    $lines[] = "{$indent}    throw new \\RuntimeException(\"Missing block callable for \" . {$targetCallableKeyCode});";
-                    $lines[] = "{$indent}}";
-                    $lines[] = "{$indent}\$wrapJump(\$targetCallable, {$stepIdCode}, {$stepIdx}, \$context, {$targetBlockCode}, {$targetIndex});";
+                    $lines[] = "{$indent}\$wrapJump({$stepIdCode}, {$stepIdx}, \$context, {$targetBlockCode}, {$targetIndex});";
                 }
 
-                $pause = isset($step["pause"]) && $step["pause"] === true;
-                if ($pause) {
+                if (($step["pause"] ?? false) === true) {
                     $lines[] = "{$indent}\$wrapPause({$blockIdCode}, {$stepIdCode}, {$stepIdx}, \$context);";
                 }
 
@@ -306,7 +318,6 @@ final class runner
                 $lines[] = "";
             }
 
-            $lines[] = "        return null;";
             $lines[] = "    };";
         }
 
@@ -316,6 +327,97 @@ final class runner
         $lines[] = "};";
 
         return implode("\n", $lines);
+    }
+
+    /**
+     * PHP code that resolves an activity or condition reference, after `function_map`.
+     *
+     * @param array<string, array{0:string,1:string|null}> $functionMap
+     */
+    private static function resolveFunctionCode(string $name, ?string $module, array $functionMap): string
+    {
+        $qualified = self::qualifiedName($name, $module);
+        if (isset($functionMap[$qualified])) {
+            [$name, $module] = $functionMap[$qualified];
+        }
+
+        return "\$resolveFunction(" . var_export($name, true) . ", " . var_export($module, true) . ")";
+    }
+
+    /**
+     * @return array<string, array{0:string,1:string|null}>
+     */
+    private static function normalizeFunctionMap(mixed $map): array
+    {
+        if (!is_array($map)) {
+            throw new RuntimeException("[divengine.runner] Option 'function_map' must be an array.");
+        }
+
+        $normalized = [];
+        foreach ($map as $from => $to) {
+            if (!is_string($to) || trim($to) === "") {
+                throw new RuntimeException(
+                    "[divengine.runner] Option 'function_map' entry '{$from}' must map to a non-empty string."
+                );
+            }
+            $normalized[trim((string) $from)] = self::parseQualifiedName(trim($to));
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * Splits `module:name` into `[name, module]`. Anything else (a plain name, a
+     * path such as `C:\fn.php` or a callable such as `Class::method`) is an
+     * unqualified reference `[reference, null]`.
+     *
+     * @return array{0:string,1:string|null}
+     */
+    private static function parseQualifiedName(string $reference): array
+    {
+        $parts = explode(":", $reference, 2);
+        if (count($parts) === 2 && self::moduleReferenceProblem($parts[0], $parts[1]) === null) {
+            return [$parts[1], $parts[0]];
+        }
+
+        return [$reference, null];
+    }
+
+    private static function qualifiedName(string $name, ?string $module): string
+    {
+        return $module === null ? $name : "{$module}:{$name}";
+    }
+
+    /**
+     * Why `$module`/`$name` is not a valid module-qualified reference, or null.
+     */
+    private static function moduleReferenceProblem(string $module, string $name): ?string
+    {
+        if (preg_match(self::MODULE_PATTERN, $module) !== 1) {
+            return "module name '{$module}' must use letters, digits, '_' or '-'";
+        }
+
+        foreach (explode("/", $name) as $segment) {
+            if ($segment === "." || $segment === ".." || preg_match('/^[A-Za-z0-9_.-]+$/', $segment) !== 1) {
+                return "function '{$name}' of module '{$module}' must be a relative name "
+                    . "(letters, digits, '_', '-', '.' and '/' between segments, no '.' or '..' segments)";
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private static function resolveModuleFolder(string $module, array $context): string
+    {
+        $modules = $context["_modules"] ?? null;
+        if (is_array($modules) && isset($modules[$module]) && is_string($modules[$module]) && trim($modules[$module]) !== "") {
+            return trim($modules[$module]);
+        }
+
+        return self::joinPath(self::resolveImporterRootFolder($context), $module);
     }
 
     /**
@@ -403,11 +505,11 @@ final class runner
 
         // Expose helper callbacks inside context for flow/activity/condition files.
         $context["_logger"] = $logger;
-        $context["_importer"] = function (string $path, ?string $unused = null) use (
+        $context["_importer"] = function (string $name, ?string $module = null) use (
             $logger,
             &$context
         ): ?callable {
-            return self::importer($path, $logger, $context);
+            return self::importer($name, $module, $context, $logger);
         };
 
         $context["_update_context"] = [self::class, "updateContext"];
@@ -432,8 +534,7 @@ final class runner
             $logger("INFO", "[divengine.runner] Initial context summary: unavailable");
         }
 
-        if (!empty($context["flow_paused"])) {
-            $context["flow_paused"] = false;
+        if (($context["_flow_state"]["block"] ?? null) !== null) {
             $logger("INFO", "[divengine.runner] Resuming paused job execution");
         }
 
@@ -446,7 +547,7 @@ final class runner
                 if ($extension === "yml" || $extension === "yaml") {
                     $func = self::flowFromYaml($flow, $options);
                 } else {
-                    $func = self::importer($flow, $logger, $context);
+                    $func = self::importer($flow, null, $context, $logger);
                 }
             }
 
@@ -462,8 +563,7 @@ final class runner
             $context["_runner_error"] = self::dumpException($e);
             $context["_runner_result"] = "Error: " . $e->getMessage();
             $logger("ERROR", "[divengine.runner] Flow setup failed - " . $e->getMessage());
-            $context["_runner_logs"] = $records;
-            $context["_runner_ended_at"] = (new DateTimeImmutable())->format(DateTimeInterface::ATOM);
+            self::finishRun($context, $records);
             throw $e;
         }
 
@@ -506,6 +606,24 @@ final class runner
             }
         }
 
+        self::finishRun($context, $records);
+    }
+
+    /**
+     * Ends a run: stores logs and end time, and removes the runner's helpers and
+     * block callables, so that what remains is the caller's data, the `_runner_*`
+     * metadata and the resume state (`_flow_state`, `_flow_stack`).
+     *
+     * @param array<string, mixed>             $context
+     * @param array<int, array<string, mixed>> $records
+     */
+    private static function finishRun(array &$context, array $records): void
+    {
+        foreach (array_merge(self::HELPER_KEYS, self::blockKeys($context)) as $key) {
+            unset($context[$key]);
+        }
+        unset($context["_flow_blocks"], $context["_flow_depth"], $context["_nested_flow_paused"]);
+
         $context["_runner_logs"] = $records;
         $context["_runner_ended_at"] = (new DateTimeImmutable())->format(DateTimeInterface::ATOM);
     }
@@ -532,6 +650,8 @@ final class runner
      *
      * @throws RuntimeException
      * @throws Throwable
+     *
+     * @internal Called by generated flow code through `__flow_loop`.
      */
     public static function flowLoop(string $initialBlock, array &$context): mixed
     {
@@ -610,12 +730,6 @@ final class runner
             }
 
             $stack = self::flowStack($context);
-            // A frame without a known calling block cannot be resumed.
-            while ($stack !== [] && $stack[count($stack) - 1]["block"] === "") {
-                array_pop($stack);
-                self::logContext($context, "WARNING", "[divengine.runner] Dropped call continuation without a calling block.");
-            }
-
             if ($stack === []) {
                 $context["_flow_stack"] = [];
                 $context["_flow_state"] = [];
@@ -646,6 +760,8 @@ final class runner
      * @param array $context Shared context by reference.
      *
      * @return bool
+     *
+     * @internal Called by generated flow code through `_resume_after_call`.
      */
     public static function resumeAfterCall(int $stepIdx, array &$context): bool
     {
@@ -667,6 +783,8 @@ final class runner
      * @param array  $data    Data to merge.
      * @param string $stepId  Step identifier.
      * @param int    $stepIdx Step index.
+     *
+     * @internal Called by generated flow code through `_update_context`.
      */
     public static function updateContext(array &$context, array $data, string $stepId, int $stepIdx): void
     {
@@ -681,6 +799,8 @@ final class runner
      * @param array $context Shared context by reference.
      *
      * @return bool
+     *
+     * @internal Called by generated flow code through `_check_pause`.
      */
     public static function checkPause(int $stepIdx, array &$context): bool
     {
@@ -731,6 +851,8 @@ final class runner
      * @param array    $context
      *
      * @return mixed
+     *
+     * @internal Called by generated flow code through `_wrap_condition`.
      */
     public static function wrapCondition(callable $func, string $stepId, int $stepIdx, array &$context): mixed
     {
@@ -745,6 +867,8 @@ final class runner
      * @param string   $stepId
      * @param int      $stepIdx
      * @param array    $context
+     *
+     * @internal Called by generated flow code through `_wrap_activity`.
      */
     public static function wrapActivity(callable $func, string $stepId, int $stepIdx, array &$context): void
     {
@@ -778,7 +902,7 @@ final class runner
             // storing a result.
             self::restoreControl($context, $snapshot, true);
             $block = $context["_current_block_id"] ?? null;
-            self::wrapPause(is_string($block) ? $block : null, $stepId, $stepIdx, $context);
+            self::wrapPause(is_string($block) ? $block : "", $stepId, $stepIdx, $context);
         }
 
         // Completed: the parent's blocks, position and call stack come back.
@@ -788,56 +912,40 @@ final class runner
     }
 
     /**
-     * Wraps a flow call: runs the target block and returns into the calling step.
+     * Runs a `call`: the target block from the target step, then back into the calling step.
      *
-     * While the call runs, a return frame `{block, step_index}` of the calling
-     * step is kept on `_flow_stack`, so a pause inside the called block can
-     * resume back into the caller. A jump whose target is the called block
-     * restarts it at the target step (nearest invocation); any other jump
-     * unwinds past this call and drops its continuation.
+     * While the call runs, the return frame `{block, step_index}` of the calling
+     * step is on `_flow_stack`. The stack is plain data stored with the context,
+     * so a pause at any depth resumes through every pending caller. A jump to
+     * the called block restarts it at the target step (nearest invocation); any
+     * other jump unwinds past this call and drops its continuation.
      *
-     * @param callable    $func
-     * @param string      $stepId
-     * @param int         $stepIdx
-     * @param array       $context
-     * @param string      $call
-     * @param int         $targetIndex
-     * @param string|null $fromBlock Calling block. Generated flows pass it, which makes the call
-     *                               resumable after a pause inside the called block; without it the
-     *                               continuation is dropped on resume (as in `vvm_strider_jobs`).
+     * @internal Called by generated flow code through `_wrap_call`.
+     *
+     * @param array<string, mixed> $context
      */
     public static function wrapCall(
-        callable $func,
         string $stepId,
         int $stepIdx,
         array &$context,
-        string $call,
+        string $targetBlock,
         int $targetIndex,
-        ?string $fromBlock = null
+        string $fromBlock
     ): void {
-        self::traceStep("call", self::callableName($func), $stepId, $stepIdx, $context, $call);
-        $targetBlock = self::extractBlockTarget($call, self::callableName($func));
-        if ($targetBlock === "") {
-            $targetBlock = self::callableName($func);
+        $func = $context["_" . $targetBlock] ?? null;
+        if (!is_callable($func)) {
+            throw new RuntimeException("Missing block callable for _{$targetBlock}");
         }
-
-        $callerBlock = $fromBlock;
-        if ($callerBlock === null && isset($context["_current_block_id"]) && is_string($context["_current_block_id"])) {
-            $callerBlock = $context["_current_block_id"];
-        }
-        // Only callers that pass `$fromBlock` (generated flows) can be re-entered
-        // after the call through `_resume_after_call`; other frames are kept for
-        // jump resolution but are not resumed.
-        $frameBlock = $fromBlock ?? "";
+        self::traceStep("call", $targetBlock, $stepId, $stepIdx, $context, "{$targetBlock}[{$targetIndex}]");
 
         $stack = self::flowStack($context);
         $maxDepth = is_int($context["_max_call_depth"] ?? null) ? $context["_max_call_depth"] : self::MAX_CALL_DEPTH;
         if (count($stack) >= $maxDepth) {
             throw new RuntimeException(
-                "[divengine.runner] Call depth exceeds {$maxDepth} at {$stepId}[{$stepIdx}] -> {$call} (recursive call?)."
+                "[divengine.runner] Call depth exceeds {$maxDepth} at {$fromBlock}.{$stepId} -> {$targetBlock} (recursive call?)."
             );
         }
-        $stack[] = ["block" => $frameBlock, "step_index" => $stepIdx];
+        $stack[] = ["block" => $fromBlock, "step_index" => $stepIdx];
         $context["_flow_stack"] = $stack;
         $depth = count($stack);
         $tokens = self::ensureTokens($context);
@@ -862,7 +970,7 @@ final class runner
         }
 
         $context["_flow_stack"] = array_slice(self::flowStack($context), 0, $depth - 1);
-        $context["_current_block_id"] = $callerBlock;
+        $context["_current_block_id"] = $fromBlock;
 
         // A pointer into the called block that no step consumed (empty block).
         if (($context["_flow_state"]["block"] ?? null) === $targetBlock) {
@@ -871,65 +979,40 @@ final class runner
     }
 
     /**
-     * Wraps a jump operation and throws a jump marker exception.
+     * Runs a `jump`: records the target and unwinds to the block loop.
      *
-     * @param callable $func
-     * @param string   $stepId
-     * @param int      $stepIdx
-     * @param array    $context
-     * @param string   $jump
-     * @param int      $targetIndex
+     * @internal Called by generated flow code through `_wrap_jump`.
      *
-     * @throws RuntimeException
+     * @param array<string, mixed> $context
+     *
+     * @throws RuntimeException Always: the jump marker.
      */
     public static function wrapJump(
-        callable $func,
         string $stepId,
         int $stepIdx,
         array &$context,
-        string $jump,
+        string $targetBlock,
         int $targetIndex
     ): never {
-        self::traceStep("jump", self::callableName($func), $stepId, $stepIdx, $context, $jump);
-        $targetBlock = self::extractBlockTarget($jump, self::callableName($func));
-        if ($targetBlock === "") {
-            $targetBlock = self::callableName($func);
-        }
+        self::traceStep("jump", $targetBlock, $stepId, $stepIdx, $context, "{$targetBlock}[{$targetIndex}]");
 
         $context["_flow_state"] = ["block" => $targetBlock, "step_index" => $targetIndex];
         $tokens = self::ensureTokens($context);
-        $token = $tokens["jump"];
-        throw new RuntimeException("{$token} Jump to {$jump}");
+        throw new RuntimeException("{$tokens["jump"]} Jump to {$targetBlock}[{$targetIndex}]");
     }
 
     /**
-     * Persists pause position and throws a pause marker exception.
+     * Runs a `pause`: records the position of the step and unwinds the run.
      *
-     * @param string|null $block
-     * @param string|null $stepId
-     * @param int|null    $stepIdx
-     * @param array       $context
+     * @internal Called by generated flow code through `_wrap_pause`.
      *
-     * @throws RuntimeException
+     * @param array<string, mixed> $context
+     *
+     * @throws RuntimeException Always: the pause marker.
      */
-    public static function wrapPause(
-        ?string $block = null,
-        ?string $stepId = null,
-        ?int $stepIdx = null,
-        array &$context = []
-    ): never {
-        if (func_num_args() < 4) {
-            throw new RuntimeException(
-                "[divengine.runner] wrapPause requires shared context as the fourth argument."
-            );
-        }
-
+    public static function wrapPause(string $block, string $stepId, int $stepIdx, array &$context): never
+    {
         $tokens = self::ensureTokens($context);
-        $token = $tokens["pause"];
-
-        $block = $block ?? ($context["_flow_state"]["block"] ?? "unknown");
-        $stepId = $stepId ?? ($context["_current_step_id"] ?? "unknown");
-        $stepIdx = $stepIdx ?? ($context["_current_step_index"] ?? -1);
 
         self::traceStep("pause", $block, $stepId, $stepIdx, $context);
 
@@ -941,7 +1024,7 @@ final class runner
             "[divengine.runner] Pausing execution at {$block}.{$stepId}[{$stepIdx}]"
         );
 
-        throw new RuntimeException("{$token} Pause at {$block}.{$stepId}[{$stepIdx}]");
+        throw new RuntimeException("{$tokens["pause"]} Pause at {$block}.{$stepId}[{$stepIdx}]");
     }
 
     /**
@@ -1580,7 +1663,7 @@ final class runner
 
     /**
      * Resolves a plain scalar with the YAML 1.1 rules of PyYAML `safe_load`,
-     * the loader used by `vvm_striders` (so `yes`/`on` are booleans, `0x1F`
+     * the loader of the Python reference modeler (so `yes`/`on` are booleans, `0x1F`
      * and `017` are integers). Timestamps and sexagesimal numbers stay strings.
      */
     private static function resolveYamlPlainScalar(string $value): mixed
@@ -1781,88 +1864,34 @@ final class runner
     private static function normalizeFlowBlocks(array $flowDef): array
     {
         $blocksRaw = $flowDef["blocks"] ?? null;
-        if (!is_array($blocksRaw)) {
+        if (!is_array($blocksRaw) || ($blocksRaw !== [] && array_is_list($blocksRaw))) {
             throw new RuntimeException(
-                "[divengine.runner] Invalid YAML flow format: 'blocks' must be defined."
+                "[divengine.runner] Invalid YAML flow format: 'blocks' must be a mapping of block id to block."
             );
         }
 
         $normalized = [];
-
-        if (array_is_list($blocksRaw)) {
-            foreach ($blocksRaw as $blockData) {
-                if (!is_array($blockData)) {
-                    throw new RuntimeException("[divengine.runner] Invalid block entry in flow list.");
-                }
-
-                $blockId = trim((string) ($blockData["id"] ?? ""));
-                $stepsRaw = $blockData["steps"] ?? [];
-                $steps = self::normalizeFlowSteps($stepsRaw);
-                $normalized[] = [
-                    "id" => $blockId,
-                    "steps" => $steps,
-                ];
-            }
-
-            return $normalized;
-        }
-
         foreach ($blocksRaw as $blockId => $blockData) {
             if (!is_array($blockData)) {
-                throw new RuntimeException(
-                    "[divengine.runner] Block '{$blockId}' must be a mapping."
-                );
+                throw new RuntimeException("[divengine.runner] Block '{$blockId}' must be a mapping.");
             }
 
             $stepsRaw = $blockData["steps"] ?? [];
-            $steps = self::normalizeFlowSteps($stepsRaw);
-            $normalized[] = [
-                "id" => trim((string) $blockId),
-                "steps" => $steps,
-            ];
-        }
-
-        return $normalized;
-    }
-
-    /**
-     * @param mixed $stepsRaw
-     *
-     * @return array<int, array<string,mixed>>
-     */
-    private static function normalizeFlowSteps(mixed $stepsRaw): array
-    {
-        if (!is_array($stepsRaw)) {
-            throw new RuntimeException("[divengine.runner] Block 'steps' must be a list or mapping.");
-        }
-
-        $normalized = [];
-
-        if (array_is_list($stepsRaw)) {
-            foreach ($stepsRaw as $stepData) {
-                if (!is_array($stepData)) {
-                    throw new RuntimeException("[divengine.runner] Invalid step entry in step list.");
-                }
-
-                $stepId = trim((string) ($stepData["id"] ?? ""));
-                $stepCopy = $stepData;
-                $stepCopy["id"] = $stepId;
-                $normalized[] = $stepCopy;
-            }
-
-            return $normalized;
-        }
-
-        foreach ($stepsRaw as $stepId => $stepData) {
-            if (!is_array($stepData)) {
+            if (!is_array($stepsRaw) || ($stepsRaw !== [] && array_is_list($stepsRaw))) {
                 throw new RuntimeException(
-                    "[divengine.runner] Step '{$stepId}' must be a mapping."
+                    "[divengine.runner] 'steps' of block '{$blockId}' must be a mapping of step id to step."
                 );
             }
 
-            $stepCopy = $stepData;
-            $stepCopy["id"] = trim((string) $stepId);
-            $normalized[] = $stepCopy;
+            $steps = [];
+            foreach ($stepsRaw as $stepId => $stepData) {
+                if (!is_array($stepData)) {
+                    throw new RuntimeException("[divengine.runner] Step '{$blockId}.{$stepId}' must be a mapping.");
+                }
+                $steps[] = ["id" => trim((string) $stepId)] + $stepData;
+            }
+
+            $normalized[] = ["id" => trim((string) $blockId), "steps" => $steps];
         }
 
         return $normalized;
@@ -1951,46 +1980,24 @@ final class runner
         }
 
         $blocks = $flowDef["blocks"] ?? null;
-        if (is_array($blocks)) {
-            $isList = array_is_list($blocks);
-            foreach ($blocks as $blockKey => $block) {
+        if (is_array($blocks) && !array_is_list($blocks)) {
+            foreach ($blocks as $blockId => $block) {
                 if (!is_array($block)) {
                     continue;
                 }
-                $blockId = $isList ? (string) ($block["id"] ?? "#{$blockKey}") : (string) $blockKey;
                 foreach (array_keys($block) as $key) {
-                    if (!in_array($key, self::BLOCK_KEYS, true) || ($key === "id" && !$isList)) {
+                    if (!in_array($key, self::BLOCK_KEYS, true)) {
                         $errors[] = "unknown key '{$key}' in block '{$blockId}'";
                     }
                 }
 
                 $steps = $block["steps"] ?? null;
-                if (!is_array($steps)) {
+                if (!is_array($steps) || array_is_list($steps)) {
                     continue;
                 }
-                $stepsAreList = array_is_list($steps);
-                foreach ($steps as $stepKey => $step) {
-                    if (!is_array($step)) {
-                        continue;
-                    }
-                    $stepId = $stepsAreList ? (string) ($step["id"] ?? "#{$stepKey}") : (string) $stepKey;
-                    $where = "step '{$blockId}.{$stepId}'";
-                    foreach ($step as $key => $value) {
-                        if (!in_array($key, self::STEP_KEYS, true) || ($key === "id" && !$stepsAreList)) {
-                            $errors[] = "unknown key '{$key}' in {$where}";
-                            continue;
-                        }
-                        if ($value === null || $key === "id" || $key === "description") {
-                            continue;
-                        }
-                        if ($key === "pause" && !is_bool($value)) {
-                            $errors[] = "'pause' in {$where} must be true or false";
-                        } elseif ($key === "context" && (!is_array($value) || ($value !== [] && array_is_list($value)))) {
-                            $errors[] = "'context' in {$where} must be a mapping";
-                        } elseif (in_array($key, ["condition", "activity", "call", "jump"], true)
-                            && (!is_string($value) || trim($value) === "")) {
-                            $errors[] = "'{$key}' in {$where} must be a non-empty string";
-                        }
+                foreach ($steps as $stepId => $step) {
+                    if (is_array($step)) {
+                        array_push($errors, ...self::stepSchemaErrors($step, "step '{$blockId}.{$stepId}'"));
                     }
                 }
             }
@@ -2001,6 +2008,54 @@ final class runner
                 "[divengine.runner] Invalid YAML flow '{$yamlPath}': " . implode("; ", $errors) . "."
             );
         }
+    }
+
+    /**
+     * @param array<mixed> $step
+     *
+     * @return array<int, string>
+     */
+    private static function stepSchemaErrors(array $step, string $where): array
+    {
+        $errors = [];
+        foreach ($step as $key => $value) {
+            if (!in_array($key, self::STEP_KEYS, true)) {
+                $errors[] = "unknown key '{$key}' in {$where}";
+                continue;
+            }
+            if ($value === null || $key === "description") {
+                continue;
+            }
+            if ($key === "pause" && !is_bool($value)) {
+                $errors[] = "'pause' in {$where} must be true or false";
+            } elseif ($key === "context" && (!is_array($value) || ($value !== [] && array_is_list($value)))) {
+                $errors[] = "'context' in {$where} must be a mapping";
+            } elseif (in_array($key, ["module", "condition", "activity", "call", "jump"], true)
+                && (!is_string($value) || trim($value) === "")) {
+                $errors[] = "'{$key}' in {$where} must be a non-empty string";
+            }
+        }
+
+        $module = $step["module"] ?? null;
+        if (!is_string($module) || trim($module) === "") {
+            return $errors;
+        }
+
+        $functions = array_filter(
+            [$step["condition"] ?? null, $step["activity"] ?? null],
+            fn (mixed $ref): bool => is_string($ref) && trim($ref) !== ""
+        );
+        if ($functions === []) {
+            $errors[] = "'module' in {$where} needs an 'activity' or a 'condition'";
+        }
+        foreach ($functions as $ref) {
+            $problem = self::moduleReferenceProblem(trim($module), trim($ref));
+            if ($problem !== null) {
+                $errors[] = "{$problem} in {$where}";
+            }
+        }
+
+        return $errors;
     }
 
     private static function validateReferenceSyntax(string $reference, string $kind): void
@@ -2136,26 +2191,6 @@ final class runner
         }
 
         return [trim($parts[0]), trim($parts[1])];
-    }
-
-    private static function extractBlockTarget(string $reference, string $fallback): string
-    {
-        $trimmedReference = trim($reference);
-        if ($trimmedReference === "") {
-            return $fallback;
-        }
-
-        if (!str_contains($trimmedReference, ".")) {
-            return $trimmedReference;
-        }
-
-        [$block] = explode(".", $trimmedReference, 2);
-        $block = trim($block);
-        if ($block === "") {
-            return $fallback;
-        }
-
-        return $block;
     }
 
     private static function isAbsolutePath(string $path): bool
