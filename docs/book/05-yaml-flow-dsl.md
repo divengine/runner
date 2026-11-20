@@ -13,10 +13,11 @@ blocks:
         activity: add_values
 ```
 
-Blocks and steps can be expressed as mapping or list forms. Normalization converts both to the same runtime model.
+Blocks and steps are mappings keyed by id; mapping order is execution order and the first block is the entry. List forms are rejected.
 
 ## Step Fields
 
+- `module`: optional module of `condition` and `activity`
 - `condition`: callable reference
 - `activity`: callable reference
 - `context`: inline key/value merge

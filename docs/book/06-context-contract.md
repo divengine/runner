@@ -21,7 +21,9 @@ Pause behavior stores continuation state in `_flow_state` (and pending call retu
 
 An activity can pause the flow by throwing an exception whose message contains `$context["_exception_pause"]`; its result is then not stored. Inside a flow used as an activity, a pause ends only that nested flow.
 
-Runner does not persist anything itself: store the context (data only) and pass it back to `runner::run()`.
+A pause can happen at any call depth: the return frames of every pending `call` are stored in `_flow_stack`, so the resumed run returns through each calling step without repeating completed steps.
+
+Runner does not persist anything itself. When `runner::run()` returns, its helpers and block callables are removed from the context, so the context is plain data: store it (for example with `json_encode()`) and pass it back to `runner::run()`, in the same or another process.
 
 ## Error Classification
 

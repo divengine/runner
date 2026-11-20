@@ -17,8 +17,8 @@ class (`divengine\runner\runner`), no runtime dependencies and a small static AP
 
 - An execution engine for PHP callables and YAML flow definitions.
 - A YAML-to-PHP compiler: a YAML flow becomes a real PHP closure you can run or save.
-- The PHP counterpart of the Python `vvm_strider_jobs` execution runtime (see
-  [SFM compatibility](docs/sfm-compatibility.md)).
+- A PHP implementation of the SFM execution semantics of the Python reference
+  runtime (see [SFM compatibility](docs/sfm-compatibility.md)).
 
 **What it is not**
 
@@ -141,8 +141,12 @@ A step may combine these keys; they run in this order:
 5. `jump`: `block.step`; transfers control without returning.
 6. `pause`: `true`; stops the run so it can be resumed after this step.
 
-Blocks do not fall through: the flow ends when the running block finishes.
-`block.` targets step 0 of a block and `.step` the current block. Block and step
+`module` (optional) names the module that the step's `condition` and `activity`
+belong to (see [Function resolution](#function-resolution)).
+
+`blocks` and `steps` are mappings keyed by id, in execution order; the first
+block is the entry. Blocks do not fall through: the flow ends when the running
+block finishes. `block.` targets step 0 of a block and `.step` the current block. Block and step
 ids must not start with `_` (reserved keys) or contain `.`. Unknown keys and
 wrongly typed values are rejected when the flow is compiled. Conditions use PHP
 truthiness, so return booleans.
@@ -157,20 +161,50 @@ $flow = runner::flowFromYaml("flows/order.yml");                // callable clos
 runner::runYaml("flows/order.yml", $context);                   // compile and run
 ```
 
-Option `function_map` (`["name" => "other_name_or_path"]`) renames function
-references at compile time.
+Option `function_map` renames activity and condition references at compile
+time. Keys and values are qualified names, `module:name` or a plain `name`:
+`["billing:total" => "billing_v2:total", "total" => "billing:total"]`.
 
 ### Function resolution
 
-`activity` and `condition` names (and `runner::importer()`) resolve in this order:
+The root folder is `_root_folder` from the context (read at each import), else
+`DIV_RUNNER_ROOT_FOLDER` (default `./`). The `.php` extension is optional and a
+file must `return` a callable.
 
-1. a PHP file under `_root_folder` (context, read at each import), else under
-   `DIV_RUNNER_ROOT_FOLDER` (default `./`); the `.php` extension is optional;
-2. the reference as a path (absolute or relative to the working directory);
+**Without `module`**, a name resolves to the first match of:
+
+1. `<root>/<name>.php`;
+2. `<name>.php` as a path (absolute or relative to the working directory);
 3. a callable name such as `strlen` or `vendor\package\fn` (e.g. Composer-autoloaded).
 
-A file must `return` a callable. A missing function fails the run with
-`Function import failed: <name>` and an error log entry.
+**With `module`**, a name resolves only inside the module folder:
+`_modules[<module>]` from the context when set, else `<root>/<module>`. Nothing
+outside that folder is tried, so the same function name in two modules never
+collides:
+
+```yaml
+steps:
+  invoice_total:
+    module: billing          # <root>/billing/total.php
+    activity: total
+  shipping_total:
+    module: shipping         # <root>/shipping/total.php
+    activity: total
+  rounded:
+    activity: round_total    # <root>/round_total.php, a path or a callable
+```
+
+```php
+$context["_modules"] = ["shipping" => "/srv/app/vendor-flows/shipping"];  // optional override
+```
+
+Module names use letters, digits, `_` and `-`; inside a module, a function name
+is relative (`total`, `rates/total`) without `.` or `..` segments. Both are
+checked at compile time. Activities import other functions with
+`$context["_importer"]("total", "shipping")` (module optional).
+
+A missing function fails the run with `Function import failed: <module>:<name>`
+(or `<name>`) and an error log entry.
 
 ## Context contract
 
@@ -187,20 +221,50 @@ thrown to the caller and also recorded in the context.
 
 - `pause: true`, or an activity that throws an exception whose message contains
   `$context["_exception_pause"]`, pauses the run at that step.
-- Resume by calling `runner::run()` again with the stored context: execution
-  continues **after** the paused step. Keep `_flow_state` and `_flow_stack` when
-  you store it (both are plain arrays and JSON-serializable).
-- A pause inside a called block resumes back into its caller (the call return
-  frames are kept in `_flow_stack`).
+- Resume by calling `runner::run()` again with the stored context, in the same
+  or another process: execution continues **after** the paused step.
+- Pauses work at any depth of `call`: the return frames of every pending call
+  are kept in `_flow_stack`, so after a pause in C (called from B, called from A)
+  the resumed run finishes C, returns into B's calling step, then into A's.
+  Steps that already ran are not repeated.
 - `_autoresume: true` makes the runner resume immediately once.
 - A pause inside a flow used as an activity ends that nested flow early (its
   result is `null`); the parent flow continues.
 
-Limitations: closures and objects in the context are not serializable, so they
-must be re-provided when you resume from storage; a resumed run does not
-re-apply your initial context for you; a failed run drops pending call frames;
-jump loops are not limited (recursive calls and nested flows are, by
-`_max_call_depth`, default 256).
+When `runner::run()` returns, the runner has removed its helpers and block
+callables from the context. What remains is your data, the `_runner_*` metadata
+and the resume state (`_flow_state`, `_flow_stack`), all plain arrays and
+scalars, so the context can be stored with `json_encode()` and resumed after
+`json_decode($json, true)`:
+
+```php
+file_put_contents("job.json", json_encode($context, JSON_THROW_ON_ERROR));
+// later, in any process:
+$context = json_decode(file_get_contents("job.json"), true, 512, JSON_THROW_ON_ERROR);
+runner::run("flows/order.yml", $context);
+```
+
+Limitations: closures and objects that *your* code puts in the context are not
+serializable, so re-provide them when you resume from storage; a resumed run
+does not re-apply your initial context for you; a failed run drops pending call
+frames, so running it again starts from the first block; jump loops are not
+limited (recursive calls and nested flows are, by `_max_call_depth`, default 256).
+
+## Public API
+
+| Method | Purpose |
+|---|---|
+| `runner::run($flow, &$context, $options)` | Run a callable, a PHP flow file or a YAML flow. Options: `logger`, `shared_context`, `function_map`, `require_context_param_name`. |
+| `runner::runYaml($path, &$context, $options)` | Compile and run a YAML flow. |
+| `runner::flowFromYaml($path, $options)` | Compile a YAML flow to a closure. |
+| `runner::generateFlowCodeFromYaml($path, $options)` | Compile a YAML flow to PHP source. |
+| `runner::importer($name, $module, $context, $logger)` | Resolve a function as described above. |
+| `runner::setLogger($logger)` | Global log sink. |
+| `runner::safeSerialize($data)`, `runner::dumpException($e)` | Diagnostic helpers. |
+
+The other public static methods (`flowLoop`, `checkPause`, `updateContext`,
+`resumeAfterCall`, `wrapCondition`, `wrapActivity`, `wrapCall`, `wrapJump`,
+`wrapPause`) are called by generated flow code and are marked `@internal`.
 
 ## Logging
 
@@ -216,7 +280,7 @@ Logs of each run are also stored in `$context["_runner_logs"]`.
 ## Documentation
 
 - [docs/README.md](docs/README.md): overview and YAML API
-- [docs/sfm-compatibility.md](docs/sfm-compatibility.md): SFM / `vvm_strider_jobs` compatibility matrix
+- [docs/sfm-compatibility.md](docs/sfm-compatibility.md): SFM compatibility matrix
 - [docs/security.md](docs/security.md): trust boundary
 - [docs/context-keys.md](docs/context-keys.md): reserved context keys
 - [docs/book/](docs/book): book chapters (`composer docs:pdf` builds a PDF)

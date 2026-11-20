@@ -70,13 +70,17 @@ Common runtime metadata includes:
 
 ## Flow Helpers
 
-The runner injects helpers into the context for flow control:
+While a flow runs, the runner injects helpers into the context for generated flow code:
 
 - `_wrap_condition`, `_wrap_activity`, `_wrap_call`, `_wrap_jump`, `_wrap_pause`
 - `_check_pause`, `_resume_after_call`, `_update_context`
 - `__flow_loop` for block-style execution
+- `_importer` and `_logger`, which activities may use
 
-These helpers mirror the `vvm_strider_jobs` Python runtime; see `docs/sfm-compatibility.md`.
+They follow the helper contract of the Python SFM reference runtime (see
+`docs/sfm-compatibility.md`) and are removed from the context, together with the
+block callables, when `runner::run()` returns. The stored context is then plain
+data that can be serialized with `json_encode()` and resumed in another process.
 
 ## YAML Flows
 
@@ -108,28 +112,26 @@ Available YAML APIs:
 Flow format notes:
 
 - Root uses `blocks` as the container of flow blocks.
+- `blocks` and `steps` are mappings keyed by id; mapping order is execution order.
 - `activity` and `condition` values can omit `.php` extension.
-- Allowed keys: flow `id`, `description`, `blocks`; block `description`, `steps`; step `description`, `condition`, `context`, `call`, `activity`, `jump`, `pause` (plus `id` in list syntax). Anything else is a compile error.
+- Allowed keys: flow `id`, `description`, `blocks`; block `description`, `steps`; step `description`, `module`, `condition`, `context`, `call`, `activity`, `jump`, `pause`. Anything else is a compile error.
 - `call` and `jump` references use `block.step` syntax.
-- `activity` and `condition` are imported as PHP callables through the standard importer.
+- `activity` and `condition` are imported as PHP callables through the standard importer, from the step's `module` when it has one.
 
-Control-flow semantics (aligned with the `vvm_strider_jobs` runtime):
+Control-flow semantics (aligned with the Python SFM reference runtime):
 
 - A step runs in this order: condition (false skips the rest of the step), context update, call, activity (its result is stored in `$context[<step_id>]`), jump, pause.
 - `call` runs the target block from the target step and then returns into the calling step, which continues with its activity, jump and pause.
 - `jump` transfers control without returning. The nearest invocation running the target block restarts at the target step; otherwise the target block becomes the running block and pending call continuations are dropped.
 - Blocks do not fall through: the flow ends when the running block returns.
-- `pause` stores the position in `_flow_state`; running the flow again with the same context resumes after the paused step. Pending call return frames are kept in `_flow_stack`, so a pause inside a called block resumes back into its caller. This differs from `vvm_strider_jobs`, where call continuations are not persisted and a resume inside a called block ends the flow when that block returns.
+- `pause` stores the position in `_flow_state`; running the flow again with the same context resumes after the paused step. Pending call return frames are kept in `_flow_stack`, so a pause at any call depth resumes back through every caller. This differs from the Python reference runtime, where call continuations are not persisted and a resume inside a called block ends the flow when that block returns.
 - YAML parsing is handled internally by runner for flow DSL inputs (no external YAML package at runtime). Supported: block mappings and sequences (including indentless and `- - x` nested sequences), plain/quoted scalars with YAML 1.1 resolution as PyYAML `safe_load`, block scalars (`|`, `>`, `-`/`+` chomping), one-line flow collections (`[a, b]`, `{k: v}`), comments. Anchors, aliases, tags and multi-line flow collections are rejected.
 - Block and step ids must not start with `_` or contain `.`.
 
-Function root precedence during YAML execution:
+Function resolution (`runner::importer(string $name, ?string $module = null, array $context = [], ?callable $logger = null)`):
 
-1. context `_root_folder` (evaluated at each import call)
-2. `DIV_RUNNER_ROOT_FOLDER` constant (default `./`)
-3. fallback `./`
-
-Notes:
-
-- `_root_folder` is a reserved runner context key.
-- Importer first tries PHP files, and if no file resolves it also accepts callable identifiers (global or namespaced functions already available in runtime/autoload).
+- Root folder: context `_root_folder` (evaluated at each import call), else the `DIV_RUNNER_ROOT_FOLDER` constant (default `./`).
+- Without a module: `<root>/<name>.php`, then `<name>.php` as a path, then a callable identifier (global or namespaced function available through autoload).
+- With a module: only `<module folder>/<name>.php`, where the module folder is `_modules[<module>]` from the context, else `<root>/<module>`. There is no fallback outside the module, so equal names in different modules do not collide.
+- Module names use letters, digits, `_` and `-`; function names inside a module are relative, without `.` or `..` segments.
+- `function_map` (compile option) maps qualified names (`module:name` or `name`) to qualified names.

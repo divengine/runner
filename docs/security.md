@@ -13,10 +13,15 @@ Runner executes code. Treat everything it runs as trusted application code.
   inject PHP syntax. But the flow chooses which functions and files run, so a
   YAML flow is as trusted as PHP code. **Runner is not a sandbox: do not run
   flows from untrusted sources.**
-- **Paths are not confined.** References may be absolute or contain `..`;
-  `_root_folder` is a resolution base, not a jail. If users can influence
-  function names, map them to an allow-list yourself (for example with the
-  `function_map` option) before running.
+- **Unqualified references are not confined.** They may be absolute paths or
+  contain `..`, and may name any callable; `_root_folder` is a resolution base,
+  not a jail. If users can influence function names, map them to an allow-list
+  yourself (for example with the `function_map` option) before running.
+- **Module-qualified references stay in their module folder.** Module names
+  (letters, digits, `_`, `-`) and function names inside a module (relative, no
+  `.` or `..` segments) are checked at compile time and again by `importer()`.
+  The folders themselves (`_modules`, root folder) are trusted code; symbolic
+  links inside them are followed.
 - **The context is shared and mutable.** Any activity can read and change any key,
   including reserved ones (`_flow_state`, `_root_folder`, helpers).
 
