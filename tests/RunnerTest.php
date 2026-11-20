@@ -1228,11 +1228,85 @@ YAML;
 
         $context = $this->runTraceFlow($yaml, null, ["fail_once" => $failOnce]);
         $this->assertSame("error", $context["_runner_state"]);
-        $this->assertSame([], $context["_flow_stack"]);
+        $this->assertResumeStateCleared($context);
 
         $context = $this->runTraceFlow($yaml, $context);
         $this->assertSame("done", $context["_runner_state"]);
         $this->assertSame(["b2", "s2"], $context["trace"]);
+    }
+
+    public function testErrorBeforeSavedPositionIsConsumedRestartsAtFirstBlock(): void
+    {
+        $paused = "blocks:\n  main:\n    steps:\n      s1:\n        activity: mark\n      s2:\n        call: sub.\n"
+            . "  sub:\n    steps:\n      p:\n        activity: mark\n        pause: true\n";
+        // The flow changed while the job was paused: the saved block is gone.
+        $changed = "blocks:\n  main:\n    steps:\n      s1:\n        activity: mark\n      s3:\n        activity: mark\n";
+
+        $context = $this->runTraceFlow($paused, ["customer" => "acme"]);
+        $this->assertSame("paused", $context["_runner_state"]);
+        $this->assertSame("sub", $context["_flow_state"]["block"]);
+        $this->assertNotSame([], $context["_flow_stack"]);
+
+        $context = $this->runTraceFlow($changed, $context);
+        $this->assertSame("error", $context["_runner_state"]);
+        $this->assertStringContainsString("Missing block callable for _sub", (string) $context["_runner_error"]);
+        $this->assertResumeStateCleared($context);
+        $this->assertSame(["s1", "p"], $context["trace"]);
+        $this->assertSame("acme", $context["customer"]);
+
+        $context = $this->runTraceFlow($changed, $context);
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame(["s1", "p", "s1", "s3"], $context["trace"]);
+    }
+
+    public function testSetupErrorOnResumeClearsSavedPosition(): void
+    {
+        $yaml = "blocks:\n  main:\n    steps:\n      s1:\n        activity: mark\n      s2:\n        call: sub.\n"
+            . "  sub:\n    steps:\n      p:\n        pause: true\n";
+        $context = $this->runTraceFlow($yaml);
+        $this->assertSame("paused", $context["_runner_state"]);
+
+        $caught = null;
+        try {
+            runner::run($context["_root_folder"] . DIRECTORY_SEPARATOR . "missing.yml", $context);
+        } catch (RuntimeException $e) {
+            $caught = $e;
+        }
+        $this->assertNotNull($caught);
+        $this->assertSame("error", $context["_runner_state"]);
+        $this->assertNotNull($context["_runner_error"]);
+        $this->assertResumeStateCleared($context);
+        $this->assertSame(["s1"], $context["trace"]);
+
+        $context = $this->runTraceFlow($yaml, $context);
+        $this->assertSame("paused", $context["_runner_state"]);
+        $this->assertSame(["s1", "s1"], $context["trace"]);
+    }
+
+    public function testErrorAfterCallReturnRestartsAtFirstBlock(): void
+    {
+        $yaml = "blocks:\n  main:\n    steps:\n      s1:\n        activity: mark\n"
+            . "      s2:\n        call: sub.\n        activity: fail_once\n      s3:\n        activity: mark\n"
+            . "  sub:\n    steps:\n      p:\n        activity: mark\n        pause: true\n";
+        $failOnce = "if (empty(\$context['failed'])) { \$context['failed'] = true; throw new \\RuntimeException('boom'); } return 'ok';";
+
+        $context = $this->runTraceFlow($yaml, null, ["fail_once" => $failOnce]);
+        $this->assertSame("paused", $context["_runner_state"]);
+
+        // Resumed: sub ends, s2 is re-entered after its call and its activity fails.
+        $context = $this->runTraceFlow($yaml, $context);
+        $this->assertSame("error", $context["_runner_state"]);
+        $this->assertStringContainsString("boom", $context["_runner_result"]);
+        $this->assertResumeStateCleared($context);
+
+        $context = $this->runTraceFlow($yaml, $context);
+        $this->assertSame("paused", $context["_runner_state"]);
+        $this->assertSame(["s1", "p", "s1", "p"], $context["trace"]);
+
+        $context = $this->runTraceFlow($yaml, $context);
+        $this->assertSame("done", $context["_runner_state"]);
+        $this->assertSame(["s1", "p", "s1", "p", "s3"], $context["trace"]);
+        $this->assertSame("ok", $context["s2"]);
     }
 
     public function testActivityClosuresUnderUnderscoreKeysPersist(): void
@@ -1768,6 +1842,16 @@ YAML;
             $this->assertFalse(is_object($value) || is_resource($value), "non-data value under '{$key}'");
         });
         $this->assertSame($context, json_decode(json_encode($context, JSON_THROW_ON_ERROR), true));
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private function assertResumeStateCleared(array $context): void
+    {
+        $this->assertSame([], $context["_flow_state"]);
+        $this->assertSame([], $context["_flow_stack"]);
+        $this->assertArrayNotHasKey("_nested_flow_paused", $context);
     }
 
     private function writeReturningFunction(string $path, string $body): void

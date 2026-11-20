@@ -563,6 +563,7 @@ final class runner
             $context["_runner_error"] = self::dumpException($e);
             $context["_runner_result"] = "Error: " . $e->getMessage();
             $logger("ERROR", "[divengine.runner] Flow setup failed - " . $e->getMessage());
+            self::clearResumeState($context);
             self::finishRun($context, $records);
             throw $e;
         }
@@ -600,13 +601,26 @@ final class runner
                 $context["_runner_state"] = "error";
                 $context["_runner_error"] = self::dumpException($e);
                 $context["_runner_result"] = "Error: " . $e->getMessage();
-                // Call return frames only matter to resume a pause.
-                $context["_flow_stack"] = [];
+                self::clearResumeState($context);
                 $logger("ERROR", "[divengine.runner] Error processing job - " . $context["_runner_error"]);
             }
         }
 
         self::finishRun($context, $records);
+    }
+
+    /**
+     * After an error, the next run starts at the first block: the saved
+     * position, call return frames and pending resume markers are dropped.
+     * Business data and the error diagnostics stay.
+     *
+     * @param array<string, mixed> $context
+     */
+    private static function clearResumeState(array &$context): void
+    {
+        $context["_flow_state"] = [];
+        $context["_flow_stack"] = [];
+        unset($context["_nested_flow_paused"]);
     }
 
     /**
