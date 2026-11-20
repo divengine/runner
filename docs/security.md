@@ -22,6 +22,10 @@ Runner executes code. Treat everything it runs as trusted application code.
   `.` or `..` segments) are checked at compile time and again by `importer()`.
   The folders themselves (`_modules`, root folder) are trusted code; symbolic
   links inside them are followed.
+- **The command line runs the same trusted code.** `bin/run.php` calls
+  `runner::run()` with the flow file and the context file it is given; it adds
+  no isolation. A context file can set reserved keys such as `_root_folder` and
+  `_modules`, so it decides which function files load: treat it as trusted input.
 - **The context is shared and mutable.** Any activity can read and change any key,
   including reserved ones (`_flow_state`, `_root_folder`, helpers).
 
