@@ -1,0 +1,20 @@
+id: pause-resume-flow
+description: Pause and resume fixture in YAML format
+blocks:
+  main:
+    steps:
+      sum_step:
+        activity: add_values
+
+      pause_once:
+        condition: should_pause_once
+        context:
+          pause_once_done: true
+        pause: true
+
+      uppercase_step:
+        activity: uppercase_text
+
+      set_flow_result:
+        context:
+          flow_result: resume_done

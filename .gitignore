@@ -1,0 +1,8 @@
+doc/*
+vendor/*
+composer.lock
+.obsidian
+.vscode
+.phpunit.result.cache
+__pycache__
+build/

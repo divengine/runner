@@ -1,0 +1,81 @@
+name: Release
+
+# Releases are created only by pushing a semantic version tag (vMAJOR.MINOR.PATCH)
+# that points to a commit already on main. Pushing code or docs never releases.
+on:
+  push:
+    tags: [ "v[0-9]+.[0-9]+.[0-9]+" ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: verify tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag, revision and release notes
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::'$tag' is not a vMAJOR.MINOR.PATCH tag"; exit 1; }
+
+          commit="$(git rev-parse "${tag}^{commit}")"
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$commit" origin/main; then
+            echo "::error::$tag ($commit) is not on main"; exit 1
+          fi
+
+          test -f "releases/${tag}.md" || { echo "::error::missing releases/${tag}.md"; exit 1; }
+
+          if jq -e 'has("version")' composer.json >/dev/null; then
+            echo "::error::composer.json must not hardcode a version; Packagist reads it from the tag"; exit 1
+          fi
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $tag already exists"; exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag at $commit"
+
+  tests:
+    needs: verify
+    uses: ./.github/workflows/tests.yml
+
+  phpstan:
+    needs: verify
+    uses: ./.github/workflows/phpstan.yml
+
+  release:
+    name: github release
+    needs: [ verify, tests, phpstan ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Divengine Runner ${TAG#v}" \
+            --notes-file "releases/${TAG}.md"

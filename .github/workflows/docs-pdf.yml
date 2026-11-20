@@ -1,0 +1,52 @@
+name: Docs PDF
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "develop", "main" ]
+    paths:
+      - "docs/**"
+      - "scripts/build_pdf.py"
+      - "scripts/puppeteer.json"
+      - ".github/workflows/docs-pdf.yml"
+      - "composer.json"
+
+permissions:
+  contents: read
+
+jobs:
+  build-docs-pdf:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Mermaid CLI
+        run: npm install -g @mermaid-js/mermaid-cli
+
+      - name: Install Pandoc and LaTeX
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc texlive-xetex texlive-latex-recommended texlive-latex-extra texlive-fonts-recommended
+
+      - name: Build docs PDF
+        run: python scripts/build_pdf.py --output runner-documentation.pdf
+
+      - name: Upload docs artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-pdf
+          path: |
+            build/runner-documentation.pdf
+            build/book.md
