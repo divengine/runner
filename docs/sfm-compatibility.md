@@ -45,8 +45,8 @@ Context keys follow the same vocabulary: `_current_block_id`, `_flow_state.block
 | Deterministic compilation | Same YAML ⇒ byte-identical PHP. | `testGeneratedCodeIsDeterministic` |
 | Schema validation | Unknown flow/block/step keys and wrong types are rejected. | `testSchemaRejectsUnknownKeysAndWrongTypes` |
 | YAML subset used by real flows | Block scalars, one-line flow collections, nested and indentless sequences, comments, quoted keys, YAML 1.1 scalar resolution as PyYAML `safe_load` (`yes`/`off` booleans, `0x1F`, `017`, `.5`). The 22 fixture flows of the Python modeler parse identically to PyYAML. | `testYamlParserSupportsBlockScalarsFlowCollectionsAndComments`, `testYamlParserMatchesPyYamlOnSequenceItemsAndScalars`, `testYamlParserRejectsMisindentedBlockScalarAndBadQuotes` |
-| Errors do not leave resumable state | A failed run drops pending call frames, so running again starts from the first block. | `testErrorInsideCalledBlockLeavesNoStaleCallFrames`, `testRepeatedPauseJumpAndErrorAcrossCallsResumeFromJson` |
-| Storable context | After `run()` returns, the context holds only data: helpers and block callables are removed. | `testContextAfterRunHoldsOnlyData`, `testDeepCallContinuationsResumeFromJsonInFreshProcesses` |
+| Errors do not leave resumable state | Any error, including setup errors and errors before a saved position is reached, clears `_flow_state`, `_flow_stack` and pending resume markers; business data and diagnostics stay, and the next run starts at the first block. | `testErrorInsideCalledBlockLeavesNoStaleCallFrames`, `testErrorBeforeSavedPositionIsConsumedRestartsAtFirstBlock`, `testSetupErrorOnResumeClearsSavedPosition`, `testErrorAfterCallReturnRestartsAtFirstBlock`, `testRepeatedPauseJumpAndErrorAcrossCallsResumeFromJson` |
+| Storable context | After `run()` returns, the runner's helpers and block callables are removed; JSON serialization of user-supplied values is not guaranteed. | `testContextAfterRunHoldsOnlyData`, `testDeepCallContinuationsResumeFromJsonInFreshProcesses` |
 
 ## Known divergences
 
@@ -70,18 +70,22 @@ Context keys follow the same vocabulary: `_current_block_id`, `_flow_state.block
 | Function signature checks | Enforced for the flow entry point (`array &$context`); activities and conditions are called with the context without a signature check. |
 | Diagnostics | Messages and logs, without the stable error codes of the Python function resolver. |
 
-## Open semantic decision
+## Called blocks versus nested flows
 
-A pause inside a flow used as an activity ends only that nested flow (ADR-I2-S01):
-its result is `null` and the parent flow continues, it does not pause. This is
-kept as is for v0.1.0. Propagating the pause to the parent, so that a nested
-flow resumes like a called block, would be a breaking semantic change and needs
-an explicit decision.
+| | Block reached by `call` | Flow used as an activity |
+|---|---|---|
+| Scope | Same flow and control state. | Own invocation and control scope. |
+| Pause inside it | Pauses the whole run; return frames stay in `_flow_stack`. | Ends the child invocation early; the activity result is `null`. |
+| On the next run | Resumes after the paused step, then returns through every caller. | Nothing to resume; the parent already continued. |
+
+Both behaviors are part of the v0.1.0 contract (the nested-flow rule follows
+ADR-I2-S01). Tests: `testDeepCallContinuationsResumeFromJsonInFreshProcesses`,
+`testPauseInsideNestedFlowIsAnEarlyReturn`.
 
 ## Missing (later development)
 
 - Persistence layer: storing a paused context, re-applying the initial context on
-  resume, job records. Runner leaves this to the caller (the context is JSON-ready).
+  resume, job records. Runner leaves this to the caller; it removes its own helpers, but JSON serialization of user-supplied values is not guaranteed.
 - `_progress` reporting key.
 - YAML files used directly as activities (compile them to PHP first, as in
   `testNestedFlowActivityRestoresParentBlocks`).

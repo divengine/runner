@@ -228,13 +228,28 @@ thrown to the caller and also recorded in the context.
   the resumed run finishes C, returns into B's calling step, then into A's.
   Steps that already ran are not repeated.
 - `_autoresume: true` makes the runner resume immediately once.
-- A pause inside a flow used as an activity ends that nested flow early (its
-  result is `null`); the parent flow continues.
 
-When `runner::run()` returns, the runner has removed its helpers and block
-callables from the context. What remains is your data, the `_runner_*` metadata
-and the resume state (`_flow_state`, `_flow_stack`), all plain arrays and
-scalars, so the context can be stored with `json_encode()` and resumed after
+**Called blocks and nested flows pause differently.** A block reached through
+`call` is part of the same flow: a pause inside it pauses the whole run, and the
+resumed run continues through every pending caller. A *flow* used as an
+activity is a separate invocation with its own control scope: a pause inside it
+ends that child invocation early, its activity result is `null`, and the parent
+flow continues without pausing. The child is not resumed later.
+
+**After an error**, `_runner_state` is `error`, `_runner_error` and
+`_runner_result` describe it, and the resume state is cleared (`_flow_state`
+and `_flow_stack` become `[]`). Your business data stays as the flow left it,
+and the next run starts at the first block. This holds for errors inside steps,
+inside called blocks and before a saved position was reached (for example a
+resumed flow whose paused block no longer exists), and for setup errors that
+`run()` throws.
+
+When `runner::run()` returns, the runner has removed its own runtime helpers
+and block callables from the context. What remains is your data, the
+`_runner_*` metadata and the resume state (`_flow_state`, `_flow_stack`). The
+runner's part is plain arrays and scalars; whether the whole context can be
+stored with `json_encode()` depends on the values your code put in it, which
+Runner does not check or convert. With data-only values it round-trips through
 `json_decode($json, true)`:
 
 ```php
@@ -244,11 +259,10 @@ $context = json_decode(file_get_contents("job.json"), true, 512, JSON_THROW_ON_E
 runner::run("flows/order.yml", $context);
 ```
 
-Limitations: closures and objects that *your* code puts in the context are not
-serializable, so re-provide them when you resume from storage; a resumed run
-does not re-apply your initial context for you; a failed run drops pending call
-frames, so running it again starts from the first block; jump loops are not
-limited (recursive calls and nested flows are, by `_max_call_depth`, default 256).
+Limitations: JSON serialization of user-supplied values is not guaranteed
+(closures, objects, resources, non-UTF-8 strings and floats such as `NAN` are
+yours to remove or re-provide when you resume from storage); a resumed run does
+not re-apply your initial context for you; jump loops are not limited (recursive calls and nested flows are, by `_max_call_depth`, default 256).
 
 ## Public API
 

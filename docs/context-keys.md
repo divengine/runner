@@ -8,8 +8,10 @@ This file is the source of truth for context keys reserved by `divengine\runner\
 - Do not reuse reserved keys for business data.
 - If a flow defines block ids in YAML, runner also reserves dynamic keys named `_<block_id>`.
 - Keys marked *run-scoped* exist only while `runner::run()` executes; they are removed
-  when it returns, so the context left behind is plain data (JSON-serializable unless
-  your own code stored objects or closures in it).
+  when it returns. The runner's remaining keys are plain data; JSON serialization of
+  values supplied by your code is not guaranteed.
+- After an error, `_flow_state` and `_flow_stack` are reset to `[]`, so the next run
+  starts at the first block.
 
 ## Reserved Keys
 
