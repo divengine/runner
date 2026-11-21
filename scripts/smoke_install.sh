@@ -75,11 +75,19 @@ fi
 echo "$actual"
 
 # Command line: pause, then resume from the saved context in a new process.
-# Releases before the bootstrap existed (packagist '^0.1') skip this part.
-if [[ "$mode" == "packagist" && ! -f "$project/vendor/divengine/runner/bin/run.php" ]]; then
-    echo "cli: skipped, the installed version has no bin/run.php"
-    echo "smoke install OK ($mode)"
-    exit 0
+# The bootstrap ships since 0.2.0, so a missing bin/run.php fails the test. The
+# only exception is an explicitly requested legacy release (packagist '^0.1').
+if [[ ! -f "$project/vendor/divengine/runner/bin/run.php" ]]; then
+    installed="$(composer --working-dir="$project" show divengine/runner --format=json \
+        | php -r 'echo ltrim(json_decode(stream_get_contents(STDIN), true)["versions"][0] ?? "", "v");')"
+    if [[ "$mode" == "packagist" && -n "${2:-}" ]] \
+        && php -r 'exit(preg_match("/^\d+\.\d+\.\d+$/", $argv[1]) && version_compare($argv[1], "0.2.0", "<") ? 0 : 1);' "$installed"; then
+        echo "cli: skipped, legacy release $installed has no bin/run.php"
+        echo "smoke install OK ($mode)"
+        exit 0
+    fi
+    echo "installed divengine/runner ${installed:-?} has no bin/run.php" >&2
+    exit 1
 fi
 cli=(php vendor/divengine/runner/bin/run.php flows/order.yml)
 cd "$project/example"
