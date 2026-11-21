@@ -34,7 +34,7 @@ jobs:
         run: composer validate --strict --no-check-lock --no-interaction
 
       - name: PHP syntax check
-        run: find src tests examples -name '*.php' -print0 | xargs -0 -n1 php -l
+        run: find bin src tests examples -name '*.php' -print0 | xargs -0 -n1 php -l
 
       - name: Install dependencies
         run: composer update --no-interaction --prefer-dist --no-progress

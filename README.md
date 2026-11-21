@@ -12,10 +12,13 @@ ordered blocks of steps that share one mutable context array, with explicit
 
 It follows the Divengine philosophy: one source file (`src/runner.php`), one
 class (`divengine\runner\runner`), no runtime dependencies and a small static API.
+A separate entry file, `bin/run.php`, runs flows from the terminal through that
+API.
 
 **What it is**
 
-- An execution engine for PHP callables and YAML flow definitions.
+- An execution engine for PHP callables and YAML flow definitions, used from
+  PHP code or from the terminal (`php vendor/divengine/runner/bin/run.php`).
 - A YAML-to-PHP compiler: a YAML flow becomes a real PHP closure you can run or save.
 - A PHP implementation of the SFM execution semantics of the Python reference
   runtime (see [SFM compatibility](docs/sfm-compatibility.md)).
@@ -205,6 +208,102 @@ checked at compile time. Activities import other functions with
 
 A missing function fails the run with `Function import failed: <module>:<name>`
 (or `<name>`) and an error log entry.
+
+## Command line
+
+The package ships a small PHP entry file that runs one flow with
+`runner::run()`. PHP itself is the executable; there is nothing else to
+install or build:
+
+```bash
+php vendor/divengine/runner/bin/run.php flows/order.yml --root functions
+php vendor/divengine/runner/bin/run.php flows/order.yml --context input.json --root functions
+php vendor/divengine/runner/bin/run.php flows/order.yml --context state.json --save-context state.json
+```
+
+| Option | Meaning |
+|---|---|
+| `<flow>` | A `.yml`, `.yaml` or `.php` flow file. |
+| `--context <file>` | Initial context: a JSON object. |
+| `--root <dir>` | Folder of activity and condition files; sets `_root_folder`. |
+| `--save-context <file>` | Write the resulting context as JSON. The file is replaced atomically (temporary file in the same folder, then rename). |
+| `--json` | Print the resulting context as JSON instead of the state. |
+| `-h`, `--help` | Usage. |
+
+Relative paths are relative to the current working directory, so run it from
+your project folder. This also applies to relative `_root_folder` and `_modules`
+values inside the context file. Without `--root` or `_root_folder`, functions
+resolve from the working directory, as with the PHP API.
+
+**Output and exit codes.** stdout carries only the result: one line with the
+final state, or the context as JSON with `--json`. Diagnostics go to stderr, and
+so does anything the flow prints, including PHP warnings, so the JSON on stdout
+stays intact.
+
+| Exit code | stdout | Meaning |
+|---|---|---|
+| `0` | `done` | The flow finished. |
+| `3` | `paused` | The flow paused; resume it with the saved context. |
+| `1` | `error` | The flow ended in the `error` state: a failing step, or a setup error such as invalid YAML. The message is on stderr. |
+| `2` | (empty) | Invocation error. Either the arguments are bad or an input is missing or unreadable, and the flow did not run. Or the context could not be saved or printed as JSON (see below); then stderr says how the flow ended and which value failed, and an existing `--save-context` file is left unchanged. |
+
+**Pause and resume across processes.** Save the context of the first run and
+pass the same file back. Each run is a new PHP process, and steps that already
+ran are not repeated:
+
+```console
+$ php vendor/divengine/runner/bin/run.php flows/order.yml --context input.json --root functions --save-context state.json
+paused
+$ echo $?
+3
+$ php vendor/divengine/runner/bin/run.php flows/order.yml --context state.json --save-context state.json
+done
+$ php -r 'echo json_decode(file_get_contents("state.json"), true)["receipt"], PHP_EOL;'
+Total: 25.00 (reviewed)
+```
+
+Before `--save-context` or `--json` writes anything, the context is checked to
+contain only values that come back unchanged from JSON: `null`, booleans,
+integers, floats, strings and arrays of them, at most 512 levels deep. Objects
+(closures included) and resources are rejected, even nested inside arrays,
+because `json_encode()` would turn them into plain JSON objects or fail. The same
+happens with values that `json_encode()` cannot encode, such as `NAN` or invalid
+UTF-8. One remaining limitation: an empty JSON object `{}` comes back as an
+empty array `[]`.
+
+`--root` is stored in the context as an absolute path, so the resume run does not
+need it again. On an error, Runner clears the resume state as it does with the
+API (see [Pause and resume](#pause-and-resume)), and the saved context then
+starts at the first block on the next run.
+
+In a shell script, test for the codes explicitly:
+
+```bash
+php vendor/divengine/runner/bin/run.php flows/order.yml --context state.json --save-context state.json
+case $? in
+  0) echo "done" ;;
+  3) echo "paused, run again later" ;;
+  *) echo "failed" >&2; exit 1 ;;
+esac
+```
+
+The entry file loads your project's Composer autoloader, so flows can use your
+classes and Composer-autoloaded functions. It does nothing else: no framework
+bootstrap, scheduler, queue or worker. Flows, activities and conditions are
+trusted PHP code; the command line does not sandbox them (see
+[Security](docs/security.md)).
+
+**Optional project shortcut.** PHP does not install a `run` command. If you want
+`php run flows/order.yml`, add this file named `run` to your project root:
+
+```php
+<?php
+require __DIR__ . "/vendor/divengine/runner/bin/run.php";
+```
+
+```bash
+php run flows/order.yml --root functions
+```
 
 ## Context contract
 

@@ -2,9 +2,9 @@
 
 ## Validation Layers
 
-- Unit tests: `vendor/bin/phpunit`
+- Unit tests: `vendor/bin/phpunit` (`tests/CliTest.php` installs the working tree as a Composer package offline and runs `bin/run.php` in fresh processes)
 - Static analysis: `vendor/bin/phpstan analyse -c phpstan.neon --no-progress --memory-limit=1G`
-- Installation smoke test: `composer smoke` (installs the `git archive` dist in a clean project and runs `examples/order`)
+- Installation smoke test: `composer smoke` (installs the `git archive` dist in a clean project and runs `examples/order` through the API and through `bin/run.php`)
 - Optional benchmark suite: `composer bench`
 
 CI runs Composer validation, PHP syntax checks, PHPUnit and the smoke test on PHP 8.1 to 8.5, and PHPStan on PHP 8.1.
