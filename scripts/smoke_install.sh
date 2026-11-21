@@ -8,13 +8,13 @@
 #   scripts/smoke_install.sh               # package built from `git archive HEAD`
 #                                          # (dist contents: export-ignore applied;
 #                                          # uncommitted changes are not included)
-#   scripts/smoke_install.sh packagist     # composer require divengine/runner:^0.1
-#   scripts/smoke_install.sh packagist '^0.2'
+#   scripts/smoke_install.sh packagist     # composer require divengine/runner:^0.2
+#   scripts/smoke_install.sh packagist '^0.1'
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mode="${1:-local}"
-constraint="${2:-^0.1}"
+constraint="${2:-^0.2}"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -75,7 +75,7 @@ fi
 echo "$actual"
 
 # Command line: pause, then resume from the saved context in a new process.
-# Releases before the bootstrap existed (v0.1.0 from Packagist) skip this part.
+# Releases before the bootstrap existed (packagist '^0.1') skip this part.
 if [[ "$mode" == "packagist" && ! -f "$project/vendor/divengine/runner/bin/run.php" ]]; then
     echo "cli: skipped, the installed version has no bin/run.php"
     echo "smoke install OK ($mode)"
