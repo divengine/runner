@@ -10,6 +10,10 @@ The package supports:
 - imported callables from PHP files
 - YAML flow definitions compiled into executable PHP closures
 
+Flows run from PHP code (`runner::run()`) or from a terminal with the bundled
+bootstrap (`php vendor/divengine/runner/bin/run.php flows/order.yml`); see the
+Command Line chapter.
+
 ## Core Terms
 
 - Flow: runtime callable that orchestrates block execution.

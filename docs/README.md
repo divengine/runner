@@ -53,6 +53,15 @@ runner::run($flow, $context);
 echo $context["greeting"]; // Hello World
 ```
 
+## Command Line
+
+```bash
+php vendor/divengine/runner/bin/run.php flows/order.yml --context input.json --root functions --save-context state.json
+```
+
+Exit codes: `0` done, `3` paused, `1` error, `2` invocation error. See the
+README and `docs/book/09-command-line.md`.
+
 ## Context Keys
 
 The canonical reserved-key reference is maintained in:

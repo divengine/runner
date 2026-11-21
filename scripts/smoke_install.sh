@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Installs divengine/runner into a clean temporary Composer project and runs
-# examples/order against the installed package, comparing its output.
+# examples/order against the installed package, comparing its output, both
+# through the PHP API (examples/order/run.php) and through the packaged
+# command-line bootstrap (vendor/divengine/runner/bin/run.php).
 #
 # Usage:
 #   scripts/smoke_install.sh               # package built from `git archive HEAD`
@@ -26,6 +28,7 @@ if [[ "$mode" == "local" ]]; then
 
     # The distributed package must contain the runtime and no development files.
     test -f "$package/src/runner.php"
+    test -f "$package/bin/run.php"
     test -f "$package/LICENSE"
     for excluded in tests docs .github bench scripts examples phpstan.neon phpunit.xml; do
         if [[ -e "$package/$excluded" ]]; then
@@ -70,4 +73,28 @@ if [[ "$actual" != "$expected" ]]; then
 fi
 
 echo "$actual"
+
+# Command line: pause, then resume from the saved context in a new process.
+# Releases before the bootstrap existed (v0.1.0 from Packagist) skip this part.
+if [[ "$mode" == "packagist" && ! -f "$project/vendor/divengine/runner/bin/run.php" ]]; then
+    echo "cli: skipped, the installed version has no bin/run.php"
+    echo "smoke install OK ($mode)"
+    exit 0
+fi
+cli=(php vendor/divengine/runner/bin/run.php flows/order.yml)
+cd "$project/example"
+ln -s ../vendor vendor
+echo '{"items": [{"price": 10, "qty": 2}, {"price": 5, "qty": 1}]}' > input.json
+
+set +e
+first="$("${cli[@]}" --context input.json --root functions --save-context state.json)"; first_exit=$?
+second="$("${cli[@]}" --context state.json --save-context state.json)"; second_exit=$?
+set -e
+
+receipt="$(php -r 'echo json_decode(file_get_contents("state.json"), true)["receipt"];')"
+if [[ "$first/$first_exit $second/$second_exit $receipt" != "paused/3 done/0 Total: 25.00 (reviewed)" ]]; then
+    echo "unexpected CLI result: $first/$first_exit $second/$second_exit $receipt" >&2
+    exit 1
+fi
+echo "cli: $first ($first_exit), $second ($second_exit), $receipt"
 echo "smoke install OK ($mode)"

@@ -25,6 +25,8 @@ flowchart TD
 - wrappers: `wrapCondition`, `wrapActivity`, `wrapCall`, `wrapJump`, `wrapPause`.
 - importer: resolves runtime references into callables.
 - YAML compiler: parses DSL and generates executable closure code.
+- `bin/run.php`: command-line bootstrap outside the library class; it reads
+  arguments and JSON files and calls `run` once. The library does not depend on it.
 
 ## Mutable Context Principle
 

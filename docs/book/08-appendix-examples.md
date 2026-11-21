@@ -37,6 +37,18 @@ $context = [
 runner::run(__DIR__ . "/flows/business_flow.yml", $context);
 ```
 
+## Running the Same Flow from a Terminal
+
+```bash
+echo '{"left": 8, "right": 5}' > input.json
+php vendor/divengine/runner/bin/run.php flows/business_flow.yml \
+    --context input.json --root activities --save-context state.json --json
+```
+
+The exit code is `0` (done), `3` (paused), `1` (error) or `2` (invocation
+error). When the flow paused, resume it with `--context state.json
+--save-context state.json`.
+
 ## Notes
 
 - Keep reserved runner keys separate from business keys.
