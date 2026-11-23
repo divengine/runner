@@ -1,0 +1,142 @@
+{
+    "protocol": "divengine.runner.trace",
+    "version": 1,
+    "mode": "simulation",
+    "flow_id": "activity_pause",
+    "result": {
+        "state": "done",
+        "error": null,
+        "setup_error": false
+    },
+    "truncated": false,
+    "events": [
+        {
+            "seq": 1,
+            "type": "run.start",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "mode": "simulation",
+            "resume": true,
+            "checkpoint": {
+                "flow_state": {
+                    "block": "main",
+                    "step_index": 2
+                },
+                "flow_stack": []
+            },
+            "context": {
+                "first": "produced",
+                "asked": true
+            }
+        },
+        {
+            "seq": 2,
+            "type": "block.enter",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "reason": "resume"
+        },
+        {
+            "seq": 3,
+            "type": "step.skip",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "first",
+            "index": 1,
+            "reason": "before_checkpoint"
+        },
+        {
+            "seq": 4,
+            "type": "step.skip",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "wait",
+            "index": 2,
+            "reason": "before_checkpoint"
+        },
+        {
+            "seq": 5,
+            "type": "step.start",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "after",
+            "index": 3,
+            "continuation": false
+        },
+        {
+            "seq": 6,
+            "type": "activity.start",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "after",
+            "index": 3,
+            "function": "consume"
+        },
+        {
+            "seq": 7,
+            "type": "double",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "after",
+            "index": 3,
+            "function": "consume",
+            "call": 1,
+            "outcome": "returns"
+        },
+        {
+            "seq": 8,
+            "type": "activity.end",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "after",
+            "index": 3,
+            "function": "consume",
+            "result": 1.0,
+            "changes": [
+                {
+                    "key": "consumed",
+                    "op": "added",
+                    "after": true
+                },
+                {
+                    "key": "after",
+                    "op": "added",
+                    "after": 1.0
+                }
+            ]
+        },
+        {
+            "seq": 9,
+            "type": "block.exit",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main"
+        },
+        {
+            "seq": 10,
+            "type": "run.end",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "state": "done",
+            "error": null,
+            "setup_error": false,
+            "checkpoint": {
+                "flow_state": [],
+                "flow_stack": []
+            },
+            "context": {
+                "first": "produced",
+                "asked": true,
+                "consumed": true,
+                "after": 1.0
+            }
+        }
+    ]
+}

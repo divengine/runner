@@ -1,0 +1,8 @@
+id: parent
+blocks:
+  main:
+    steps:
+      child:
+        activity: child_flow
+      after:
+        activity: consume

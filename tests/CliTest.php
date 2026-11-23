@@ -391,6 +391,165 @@ blocks:
         $this->assertSame([3, "paused\n", ""], [$result["exit"], $result["stdout"], $result["stderr"]]);
     }
 
+    public function testTraceKeepsStdoutExitCodeAndSavedContext(): void
+    {
+        $this->copyExample();
+        $this->writeJson("input.json", ["items" => [["price" => 10, "qty" => 2], ["price" => 5, "qty" => 1]]]);
+        $args = ["flows/order.yml", "--context", "input.json", "--root", "functions"];
+
+        $plain = $this->cli(array_merge($args, ["--save-context", "plain.json"]));
+        $traced = $this->cli(array_merge($args, ["--save-context", "traced.json", "--trace", "trace.json"]));
+
+        $this->assertSame([3, "paused\n", ""], [$plain["exit"], $plain["stdout"], $plain["stderr"]]);
+        $this->assertSame([$plain["exit"], $plain["stdout"], $plain["stderr"]], [$traced["exit"], $traced["stdout"], $traced["stderr"]]);
+        $this->assertSame($this->comparableContext($this->readJson("plain.json")), $this->comparableContext($this->readJson("traced.json")));
+        $this->assertSame(array_keys($this->readJson("plain.json")), array_keys($this->readJson("traced.json")));
+
+        $trace = $this->readJson("trace.json");
+        $this->assertSame(["divengine.runner.trace", 1, "run"], [$trace["protocol"], $trace["version"], $trace["mode"]]);
+        $this->assertSame("paused", $trace["result"]["state"]);
+        $this->assertSame(["flow", "function", "function"], array_column($trace["sources"], "role"));
+        $this->assertSame(["flows", "functions", "input.json", "plain.json", "trace.json", "traced.json", "vendor"], $this->projectEntries());
+
+        $resumed = $this->cli(["flows/order.yml", "--context", "traced.json", "--save-context", "traced.json", "--trace", "trace.json"]);
+        $this->assertSame([0, "done\n"], [$resumed["exit"], $resumed["stdout"]], $resumed["stderr"]);
+        $this->assertTrue($this->readJson("trace.json")["events"][0]["resume"]);
+    }
+
+    public function testSimulationResumesAcrossProcessesWithoutLoadingFunctions(): void
+    {
+        $this->copySimulationExample();
+        $segment = ["flows/invoice.yml", "--simulate", "doubles.json", "--session", "session.json"];
+
+        $first = $this->cli(array_merge($segment, ["--context", "context.json", "--trace", "trace-1.json"]));
+        $this->assertSame([3, "paused\n", ""], [$first["exit"], $first["stdout"], $first["stderr"]]);
+        $session = $this->readJson("session.json");
+        $this->assertSame(["divengine.runner.simulation-session", 1], [$session["protocol"], $session["version"]]);
+        $this->assertSame(["block" => "approval", "step_index" => 1], $session["context"]["_flow_state"]);
+        $this->assertSame([["block" => "main", "step_index" => 3]], $session["context"]["_flow_stack"]);
+
+        $second = $this->cli(array_merge($segment, ["--trace", "trace-2.json"]));
+        $this->assertSame([0, "done\n", ""], [$second["exit"], $second["stdout"], $second["stderr"]]);
+
+        $traces = [$this->readJson("trace-1.json"), $this->readJson("trace-2.json")];
+        $this->assertExampleGolden("segment-1", $traces[0]);
+        $this->assertExampleGolden("segment-2", $traces[1]);
+        $this->assertSame($traces[0]["fingerprint"], $traces[1]["fingerprint"]);
+        $this->assertSame(["flow", "doubles"], array_column($traces[1]["sources"], "role"));
+
+        $final = $this->readJson("session.json")["context"];
+        $this->assertSame(["done", "receipt sent", "captured"], [$final["_runner_state"], $final["receipt"], $final["last_charge"]]);
+        $this->assertFileDoesNotExist($this->project . "/outbox.log");
+        $this->assertFileDoesNotExist($this->project . "/payments.log");
+        $this->assertStringNotContainsString("tok_visa_4242", (string) file_get_contents($this->project . "/trace-1.json"));
+    }
+
+    public function testSimulationNeverOverwritesANormalRunCheckpoint(): void
+    {
+        $this->copySimulationExample();
+        $this->writeFile("state.json", "{\"_flow_state\": {\"block\": \"main\", \"step_index\": 2}}\n");
+
+        $result = $this->cli(["flows/invoice.yml", "--simulate", "doubles.json", "--session", "state.json"]);
+
+        $this->assertSame([2, ""], [$result["exit"], $result["stdout"]]);
+        $this->assertStringContainsString("is not a simulation session", $result["stderr"]);
+        $this->assertSame("{\"_flow_state\": {\"block\": \"main\", \"step_index\": 2}}\n", file_get_contents($this->project . "/state.json"));
+    }
+
+    public function testChangedDoublesRefuseToResumeASession(): void
+    {
+        $this->copySimulationExample();
+        $segment = ["flows/invoice.yml", "--simulate", "doubles.json", "--session", "session.json"];
+        $this->assertSame(3, $this->cli(array_merge($segment, ["--context", "context.json"]))["exit"]);
+        $saved = file_get_contents($this->project . "/session.json");
+
+        $doubles = $this->readJson("doubles.json");
+        $doubles["doubles"]["send_receipt"]["returns"] = "changed";
+        $this->writeJson("doubles.json", $doubles);
+        $result = $this->cli($segment);
+
+        $this->assertSame([2, ""], [$result["exit"], $result["stdout"]]);
+        $this->assertStringContainsString("changed: expected fingerprint sha256:", $result["stderr"]);
+        $this->assertSame($saved, file_get_contents($this->project . "/session.json"));
+    }
+
+    public function testUnmockedFunctionEndsTheSimulationInError(): void
+    {
+        $this->copySimulationExample();
+        $doubles = $this->readJson("doubles.json");
+        unset($doubles["doubles"]["billing:compute_total"]);
+        $this->writeJson("doubles.json", $doubles);
+
+        $result = $this->cli(["flows/invoice.yml", "--simulate", "doubles.json", "--context", "context.json", "--session", "s.json", "--trace", "t.json"]);
+
+        $this->assertSame([1, "error\n"], [$result["exit"], $result["stdout"]]);
+        $this->assertStringContainsString("no double for function 'billing:compute_total'", $result["stderr"]);
+        $this->assertSame("error", $this->readJson("s.json")["context"]["_runner_state"]);
+        $this->assertContains("function.missing", array_column($this->readJson("t.json")["events"], "type"));
+        $this->assertFileDoesNotExist($this->project . "/payments.log");
+    }
+
+    public function testSimulationBudgetEndsTheRunInError(): void
+    {
+        $this->writeFile("flows/loop.yml", "id: loop\nblocks:\n  main:\n    steps:\n      spin:\n        jump: main.spin\n");
+        $this->writeJson("doubles.json", ["doubles" => [], "budget" => ["transfers" => 3]]);
+
+        $result = $this->cli(["flows/loop.yml", "--simulate", "doubles.json", "--trace", "t.json"]);
+
+        $this->assertSame([1, "error\n"], [$result["exit"], $result["stdout"]]);
+        $this->assertStringContainsString("budget exhausted: transfers (limit 3)", $result["stderr"]);
+        $types = array_column($this->readJson("t.json")["events"], "type");
+        $this->assertSame(["budget.exhausted", "run.end"], array_slice($types, -2));
+    }
+
+    /**
+     * @return array<string, array{0: list<string>, 1: string}>
+     */
+    public static function simulationInvocationErrors(): array
+    {
+        $sim = ["flows/invoice.yml", "--simulate", "doubles.json"];
+        return [
+            "with --save-context" => [array_merge($sim, ["--save-context", "out.json"]), "--save-context cannot be used with --simulate"],
+            "with --root" => [array_merge($sim, ["--root", "functions"]), "--root cannot be used with --simulate"],
+            "php flow" => [["flows/hello.php", "--simulate", "doubles.json"], "--simulate runs YAML flows only"],
+            "session without simulate" => [["flows/invoice.yml", "--session", "s.json"], "--session needs --simulate"],
+            "context and existing session" => [array_merge($sim, ["--session", "session.json", "--context", "context.json"]),
+                "--context cannot be used to resume"],
+            "trace over context" => [array_merge($sim, ["--context", "context.json", "--trace", "context.json"]),
+                "--trace must not be the same file as --context"],
+            "session over doubles" => [array_merge($sim, ["--session", "doubles.json"]), "is not a simulation session"],
+            "trace over session" => [array_merge($sim, ["--session", "s.json", "--trace", "s.json"]), "--trace must not be the same file as --session"],
+            "doubles not json" => [["flows/invoice.yml", "--simulate", "context.txt"], "invalid JSON in --simulate file"],
+            "unknown key" => [["flows/invoice.yml", "--simulate", "unknown.json"], "unknown key in --simulate file: mocks"],
+            "invalid double" => [["flows/invoice.yml", "--simulate", "invalid.json"], "needs exactly one of"],
+            "invalid budget" => [["flows/invoice.yml", "--simulate", "budget.json"], "must be a positive integer"],
+        ];
+    }
+
+    /**
+     * @dataProvider simulationInvocationErrors
+     *
+     * @param list<string> $args
+     */
+    public function testSimulationInvocationErrorsExitTwoWithoutWriting(array $args, string $message): void
+    {
+        $this->copySimulationExample();
+        $this->writeFile("flows/hello.php", "<?php\nreturn fn (array &\$context) => null;\n");
+        $this->writeFile("session.json", json_encode(["protocol" => "divengine.runner.simulation-session", "version" => 1,
+            "fingerprint" => "sha256:x", "double_calls" => [], "context" => ["a" => 1]]) . "\n");
+        $this->writeFile("context.txt", "not json");
+        $this->writeJson("unknown.json", ["mocks" => []]);
+        $this->writeJson("invalid.json", ["doubles" => ["send_receipt" => ["returns" => 1, "throws" => "x"]]]);
+        $this->writeJson("budget.json", ["doubles" => [], "budget" => ["steps" => 0]]);
+        $before = $this->projectEntries();
+
+        $result = $this->cli($args);
+
+        $this->assertSame([2, ""], [$result["exit"], $result["stdout"]], $result["stderr"]);
+        $this->assertStringContainsString($message, $result["stderr"]);
+        $this->assertSame($before, $this->projectEntries(), "nothing was written");
+    }
+
     public function testHelpGoesToStdoutAndExitsZero(): void
     {
         $result = $this->cli(["--help"]);
@@ -472,6 +631,60 @@ blocks:
         fclose($pipes[2]);
 
         return ["exit" => proc_close($process), "stdout" => $stdout, "stderr" => $stderr];
+    }
+
+    private function copySimulationExample(): void
+    {
+        $source = dirname(__DIR__) . "/examples/simulation";
+        $files = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($source, \FilesystemIterator::SKIP_DOTS));
+        foreach ($files as $file) {
+            $relative = substr((string) $file, strlen($source) + 1);
+            if (!str_starts_with($relative, "expected")) {
+                $this->writeFile($relative, (string) file_get_contents((string) $file));
+            }
+        }
+    }
+
+    /**
+     * The deterministic part of an example trace, as stored in examples/simulation/expected.
+     * Regenerate with RUNNER_UPDATE_GOLDEN=1 after an intended change.
+     *
+     * @param array<string, mixed> $trace
+     */
+    private function assertExampleGolden(string $name, array $trace): void
+    {
+        $semantic = [
+            "protocol" => $trace["protocol"],
+            "version" => $trace["version"],
+            "mode" => $trace["mode"],
+            "flow_id" => $trace["flow"]["id"],
+            "result" => $trace["result"],
+            "simulation" => $trace["simulation"],
+            "truncated" => $trace["truncated"],
+            "events" => $trace["events"],
+        ];
+        $json = json_encode($semantic, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
+            | JSON_PRESERVE_ZERO_FRACTION | JSON_THROW_ON_ERROR) . "\n";
+        $file = dirname(__DIR__) . "/examples/simulation/expected/{$name}.json";
+        if (getenv("RUNNER_UPDATE_GOLDEN") === "1") {
+            file_put_contents($file, $json);
+        }
+        $this->assertSame((string) file_get_contents($file), $json, "example golden {$name}");
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     *
+     * @return array<string, mixed>
+     */
+    private function comparableContext(array $context): array
+    {
+        foreach (["_runner_started_at", "_runner_ended_at", "_runner_result", "_runner_logs", "_exception_pause_token",
+            "_exception_jump_token", "_exception_pause", "_exception_jump"] as $key) {
+            unset($context[$key]);
+        }
+
+        return $context;
     }
 
     private function copyExample(): void

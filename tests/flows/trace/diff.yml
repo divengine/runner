@@ -1,0 +1,10 @@
+id: diff
+blocks:
+  main:
+    steps:
+      setup:
+        context:
+          status: new
+          count: 1
+      mutate:
+        activity: mutate

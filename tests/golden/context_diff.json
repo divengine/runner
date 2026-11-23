@@ -1,0 +1,169 @@
+{
+    "protocol": "divengine.runner.trace",
+    "version": 1,
+    "mode": "run",
+    "flow_id": "diff",
+    "result": {
+        "state": "done",
+        "error": null,
+        "setup_error": false
+    },
+    "truncated": false,
+    "events": [
+        {
+            "seq": 1,
+            "type": "run.start",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "mode": "run",
+            "resume": false,
+            "checkpoint": {
+                "flow_state": [],
+                "flow_stack": []
+            },
+            "context": {
+                "obsolete": true,
+                "api_key": {
+                    "$type": "redacted"
+                }
+            }
+        },
+        {
+            "seq": 2,
+            "type": "block.enter",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "reason": "start"
+        },
+        {
+            "seq": 3,
+            "type": "step.start",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "setup",
+            "index": 1,
+            "continuation": false
+        },
+        {
+            "seq": 4,
+            "type": "context.update",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "setup",
+            "index": 1,
+            "changes": [
+                {
+                    "key": "status",
+                    "op": "added",
+                    "after": "new"
+                },
+                {
+                    "key": "count",
+                    "op": "added",
+                    "after": 1
+                }
+            ]
+        },
+        {
+            "seq": 5,
+            "type": "step.start",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "mutate",
+            "index": 2,
+            "continuation": false
+        },
+        {
+            "seq": 6,
+            "type": "activity.start",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "mutate",
+            "index": 2,
+            "function": "mutate"
+        },
+        {
+            "seq": 7,
+            "type": "activity.end",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "mutate",
+            "index": 2,
+            "function": "mutate",
+            "result": {
+                "ok": true
+            },
+            "changes": [
+                {
+                    "key": "status",
+                    "op": "changed",
+                    "before": "new",
+                    "after": "done"
+                },
+                {
+                    "key": "count",
+                    "op": "changed",
+                    "before": 1,
+                    "after": 2
+                },
+                {
+                    "key": "password",
+                    "op": "added",
+                    "after": {
+                        "$type": "redacted"
+                    }
+                },
+                {
+                    "key": "mutate",
+                    "op": "added",
+                    "after": {
+                        "ok": true
+                    }
+                },
+                {
+                    "key": "obsolete",
+                    "op": "removed"
+                }
+            ]
+        },
+        {
+            "seq": 8,
+            "type": "block.exit",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main"
+        },
+        {
+            "seq": 9,
+            "type": "run.end",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "state": "done",
+            "error": null,
+            "setup_error": false,
+            "checkpoint": {
+                "flow_state": [],
+                "flow_stack": []
+            },
+            "context": {
+                "api_key": {
+                    "$type": "redacted"
+                },
+                "status": "done",
+                "count": 2,
+                "password": {
+                    "$type": "redacted"
+                },
+                "mutate": {
+                    "ok": true
+                }
+            }
+        }
+    ]
+}

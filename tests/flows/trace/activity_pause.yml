@@ -1,0 +1,10 @@
+id: activity_pause
+blocks:
+  main:
+    steps:
+      first:
+        activity: produce
+      wait:
+        activity: wait_for_input
+      after:
+        activity: consume
