@@ -15,6 +15,9 @@
  * - Exit codes: 0 done, 1 error (the flow ended in the `error` state),
  *   2 invocation error (bad arguments, unreadable input, context not saved),
  *   3 paused.
+ * - `--trace <file>` writes a semantic trace (`runner::runTraced()`), and
+ *   `--simulate <doubles.json>` simulates a YAML flow with test doubles
+ *   (`runner::simulate()`); neither changes stdout or the exit codes.
  *
  * Relative paths (flow, --context, --root, --save-context) are relative to the
  * current working directory.
@@ -28,6 +31,7 @@ namespace divengine\runner\cli;
 
 use divengine\runner\runner;
 use ErrorException;
+use InvalidArgumentException;
 use JsonException;
 use RuntimeException;
 use Throwable;
@@ -57,6 +61,10 @@ function usage(): string
           --root <dir>           Folder of activity and condition files (sets _root_folder).
           --save-context <file>  Write the resulting context as JSON (atomic replace).
           --json                 Print the resulting context as JSON instead of the state.
+          --trace <file>         Write a semantic trace of the run as JSON (atomic replace).
+          --simulate <file>      Simulate a YAML flow with the test doubles in this JSON file;
+                                 no function file is loaded.
+          --session <file>       Simulation state: resumed when the file exists, then rewritten.
           -h, --help             Show this help.
 
         stdout: the final state (done, paused, error) or, with --json, the context.
@@ -75,12 +83,19 @@ function usage(): string
 /**
  * @param list<string> $args Arguments without the script name.
  *
- * @return array{flow: string, context: ?string, root: ?string, save: ?string, json: bool, help: bool}
+ * @return array{flow: string, context: ?string, root: ?string, save: ?string, trace: ?string,
+ *     simulate: ?string, session: ?string, json: bool, help: bool}
  */
 function parseArguments(array $args): array
 {
-    $options = ["flow" => null, "context" => null, "root" => null, "save" => null, "json" => false, "help" => false];
-    $valueOptions = ["context" => "context", "root" => "root", "save-context" => "save"];
+    $options = [
+        "flow" => null, "context" => null, "root" => null, "save" => null,
+        "trace" => null, "simulate" => null, "session" => null, "json" => false, "help" => false,
+    ];
+    $valueOptions = [
+        "context" => "context", "root" => "root", "save-context" => "save",
+        "trace" => "trace", "simulate" => "simulate", "session" => "session",
+    ];
     $onlyPositional = false;
 
     for ($i = 0, $count = count($args); $i < $count; $i++) {
@@ -334,6 +349,107 @@ function writeAtomically(string $target, string $contents): void
     }
 }
 
+const SESSION_PROTOCOL = "divengine.runner.simulation-session";
+const SESSION_VERSION = 1;
+
+/**
+ * Reads a JSON object file for an option.
+ *
+ * @return array<string, mixed>
+ */
+function readJsonObject(string $path, string $option): array
+{
+    if (!is_file($path) || !is_readable($path)) {
+        throw new UsageError("{$option} file not found or not readable: {$path}");
+    }
+    try {
+        $data = json_decode((string) file_get_contents($path), true, JSON_DEPTH + 1, JSON_THROW_ON_ERROR);
+    } catch (JsonException $e) {
+        throw new UsageError("invalid JSON in {$option} file {$path}: " . $e->getMessage());
+    }
+    if (!is_array($data) || ($data !== [] && array_is_list($data))) {
+        throw new UsageError("{$option} file must contain a JSON object: {$path}");
+    }
+    return $data;
+}
+
+/**
+ * Reads the doubles file of --simulate: {"doubles": {...}, "budget": {...}, "trace": {...}}.
+ *
+ * @return array{doubles: array<string, mixed>, budget: array<string, mixed>, trace: array<string, mixed>}
+ */
+function readDoubles(string $path): array
+{
+    $spec = readJsonObject($path, "--simulate");
+    $unknown = array_diff(array_keys($spec), ["doubles", "budget", "trace", "description"]);
+    if ($unknown !== []) {
+        throw new UsageError("unknown key in --simulate file: " . implode(", ", $unknown));
+    }
+    foreach (["doubles", "budget", "trace"] as $key) {
+        $value = $spec[$key] ?? [];
+        if (!is_array($value) || ($value !== [] && array_is_list($value))) {
+            throw new UsageError("'{$key}' in --simulate file must be a JSON object");
+        }
+        $spec[$key] = $value;
+    }
+    return ["doubles" => $spec["doubles"], "budget" => $spec["budget"], "trace" => $spec["trace"]];
+}
+
+/**
+ * Reads an existing simulation session file, or null when it does not exist.
+ * A file that is not a session (a normal-run context, for example) is refused,
+ * so a simulation never overwrites it.
+ *
+ * @return array{fingerprint: string, double_calls: array<string, int>, context: array<string, mixed>}|null
+ */
+function readSession(string $path): ?array
+{
+    if (!file_exists($path)) {
+        return null;
+    }
+    $session = readJsonObject($path, "--session");
+    if (($session["protocol"] ?? null) !== SESSION_PROTOCOL || ($session["version"] ?? null) !== SESSION_VERSION) {
+        throw new UsageError("--session file is not a simulation session (protocol " . SESSION_PROTOCOL
+            . " version " . SESSION_VERSION . "); it was left untouched: {$path}");
+    }
+    $context = $session["context"] ?? null;
+    $calls = $session["double_calls"] ?? null;
+    if (!is_string($session["fingerprint"] ?? null) || !is_array($context) || !is_array($calls)
+        || ($context !== [] && array_is_list($context))) {
+        throw new UsageError("--session file is incomplete or invalid: {$path}");
+    }
+    return ["fingerprint" => $session["fingerprint"], "double_calls" => $calls, "context" => $context];
+}
+
+/**
+ * Refuses an output path that is also another input or output of the run.
+ *
+ * @param array<string, ?string> $others Option name => path given for it.
+ */
+function assertDistinctPath(string $option, string $target, array $others): void
+{
+    foreach ($others as $name => $path) {
+        if ($path === null) {
+            continue;
+        }
+        $other = realpath(absolutePath($path));
+        $other = $other === false ? absolutePath($path) : $other;
+        if ($other === $target) {
+            throw new UsageError("{$option} must not be the same file as {$name}: {$path}");
+        }
+    }
+}
+
+/**
+ * @param array<string, mixed> $trace
+ */
+function encodeTrace(array $trace): string
+{
+    // Trace values are already JSON-safe and bounded by the trace caps.
+    return json_encode($trace, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
+        | JSON_PRESERVE_ZERO_FRACTION | JSON_INVALID_UTF8_SUBSTITUTE, JSON_DEPTH) . "\n";
+}
+
 /**
  * @param list<string> $argv
  */
@@ -362,7 +478,31 @@ function main(array $argv): int
             throw new UsageError("flow must be a .yml, .yaml or .php file: {$options["flow"]}");
         }
 
-        $context = $options["context"] !== null ? readContext(absolutePath($options["context"])) : [];
+        $simulate = $options["simulate"] !== null;
+        if (!$simulate && $options["session"] !== null) {
+            throw new UsageError("--session needs --simulate");
+        }
+        if ($simulate) {
+            if ($extension === "php") {
+                throw new UsageError("--simulate runs YAML flows only: {$options["flow"]}");
+            }
+            foreach (["save" => "--save-context", "root" => "--root"] as $key => $name) {
+                if ($options[$key] !== null) {
+                    throw new UsageError("{$name} cannot be used with --simulate: a simulation loads no functions"
+                        . " and writes no run context (use --session)");
+                }
+            }
+        }
+        $spec = $simulate ? readDoubles(absolutePath((string) $options["simulate"])) : null;
+
+        $sessionTarget = $options["session"] !== null ? saveTarget($options["session"]) : null;
+        $session = $sessionTarget !== null ? readSession($sessionTarget) : null;
+        if ($session !== null && $options["context"] !== null) {
+            throw new UsageError("--context cannot be used to resume an existing --session");
+        }
+
+        $context = $session !== null ? $session["context"]
+            : ($options["context"] !== null ? readContext(absolutePath($options["context"])) : []);
 
         if ($options["root"] !== null) {
             $root = realpath(absolutePath($options["root"]));
@@ -373,6 +513,21 @@ function main(array $argv): int
         }
 
         $saveTarget = $options["save"] !== null ? saveTarget($options["save"]) : null;
+        $traceTarget = $options["trace"] !== null ? saveTarget($options["trace"]) : null;
+
+        $inputs = ["the flow" => $options["flow"], "--context" => $options["context"], "--simulate" => $options["simulate"]];
+        if ($traceTarget !== null) {
+            assertDistinctPath("--trace", $traceTarget, $inputs + [
+                "--save-context" => $options["save"],
+                "--session" => $options["session"],
+            ]);
+        }
+        if ($sessionTarget !== null) {
+            assertDistinctPath("--session", $sessionTarget, $inputs);
+        }
+        if ($saveTarget !== null) {
+            assertDistinctPath("--save-context", $saveTarget, ["the flow" => $options["flow"]]);
+        }
     } catch (UsageError $e) {
         fwrite(STDERR, "runner: " . $e->getMessage() . "\n");
         fwrite(STDERR, "Try --help for usage.\n");
@@ -390,8 +545,26 @@ function main(array $argv): int
         return "";
     }, 1);
 
+    $trace = null;
     try {
-        runner::run($flow, $context);
+        if ($spec !== null) {
+            $trace = runner::simulate($flow, $context, $spec["doubles"], [
+                "budget" => $spec["budget"],
+                "trace" => $spec["trace"],
+                "double_calls" => $session["double_calls"] ?? [],
+            ] + ($session !== null ? ["fingerprint" => $session["fingerprint"]] : []));
+        } elseif ($traceTarget !== null) {
+            $trace = runner::runTraced($flow, $context);
+        } else {
+            runner::run($flow, $context);
+        }
+    } catch (InvalidArgumentException $e) {
+        // Invalid doubles, budget or trace options, or a changed source: nothing ran.
+        while (ob_get_level() > $level) {
+            ob_end_flush();
+        }
+        fwrite(STDERR, "runner: " . $e->getMessage() . "\n");
+        return EXIT_USAGE;
     } catch (Throwable $e) {
         // Setup errors are thrown after Runner records them in the context.
         if (($context["_runner_state"] ?? null) !== "error") {
@@ -429,6 +602,32 @@ function main(array $argv): int
         } catch (Throwable $e) {
             fwrite(STDERR, "runner: flow ended {$state}, but the context was not saved: "
                 . $e->getMessage() . "\n");
+            return EXIT_USAGE;
+        }
+    }
+
+    if ($sessionTarget !== null && $trace !== null) {
+        $document = [
+            "protocol" => SESSION_PROTOCOL,
+            "version" => SESSION_VERSION,
+            "fingerprint" => $trace["fingerprint"],
+            "double_calls" => $trace["simulation"]["double_calls"] ?? [],
+            "context" => $context,
+        ];
+        try {
+            writeAtomically($sessionTarget, encodeContext($document));
+        } catch (Throwable $e) {
+            fwrite(STDERR, "runner: simulation ended {$state}, but the session was not saved: "
+                . $e->getMessage() . "\n");
+            return EXIT_USAGE;
+        }
+    }
+
+    if ($traceTarget !== null && $trace !== null) {
+        try {
+            writeAtomically($traceTarget, encodeTrace($trace));
+        } catch (Throwable $e) {
+            fwrite(STDERR, "runner: flow ended {$state}, but the trace was not saved: " . $e->getMessage() . "\n");
             return EXIT_USAGE;
         }
     }
