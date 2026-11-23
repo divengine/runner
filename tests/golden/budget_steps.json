@@ -7,7 +7,9 @@
         "state": "error",
         "error": {
             "class": "RuntimeException",
-            "message": "[divengine.runner] Simulation budget exhausted: steps (limit 3)."
+            "message": {
+                "$type": "redacted"
+            }
         },
         "setup_error": false
     },
@@ -265,7 +267,9 @@
             "state": "error",
             "error": {
                 "class": "RuntimeException",
-                "message": "[divengine.runner] Simulation budget exhausted: steps (limit 3)."
+                "message": {
+                    "$type": "redacted"
+                }
             },
             "setup_error": false,
             "checkpoint": {

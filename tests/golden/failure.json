@@ -7,7 +7,9 @@
         "state": "error",
         "error": {
             "class": "RuntimeException",
-            "message": "card declined"
+            "message": {
+                "$type": "redacted"
+            }
         },
         "setup_error": false
     },
@@ -127,7 +129,9 @@
             "function": "fail",
             "error": {
                 "class": "RuntimeException",
-                "message": "card declined"
+                "message": {
+                    "$type": "redacted"
+                }
             }
         },
         {
@@ -138,7 +142,9 @@
             "state": "error",
             "error": {
                 "class": "RuntimeException",
-                "message": "card declined"
+                "message": {
+                    "$type": "redacted"
+                }
             },
             "setup_error": false,
             "checkpoint": {

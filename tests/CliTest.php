@@ -502,6 +502,33 @@ blocks:
         $this->assertSame(["budget.exhausted", "run.end"], array_slice($types, -2));
     }
 
+    public function testTraceLeavesMessagesOutUnlessRequested(): void
+    {
+        $this->writeFile("flows/leak.yml", "id: leak\nblocks:\n  main:\n    steps:\n      go:\n        activity: leak\n");
+        $this->writeFile("functions/leak.php", "<?php\nreturn function (array &\$context): void {\n"
+            . "    \$context['_logger']('INFO', 'log token=LOGSECRET');\n"
+            . "    throw new RuntimeException('error password=ERRSECRET');\n};\n");
+        $args = ["flows/leak.yml", "--root", "functions", "--trace", "t.json"];
+
+        $default = $this->cli($args);
+        $this->assertSame([1, "error\n"], [$default["exit"], $default["stdout"]]);
+        $this->assertStringContainsString("ERRSECRET", $default["stderr"], "diagnostics on stderr are unchanged");
+        $trace = (string) file_get_contents($this->project . "/t.json");
+        $this->assertStringNotContainsString("LOGSECRET", $trace);
+        $this->assertStringNotContainsString("ERRSECRET", $trace);
+        $this->assertSame(['$type' => "redacted"], $this->readJson("t.json")["result"]["error"]["message"]);
+
+        $opted = $this->cli(array_merge($args, ["--trace-messages"]));
+        $this->assertSame([$default["exit"], $default["stdout"]], [$opted["exit"], $opted["stdout"]]);
+        $this->assertSame("error password=ERRSECRET", $this->readJson("t.json")["result"]["error"]["message"]);
+        $this->assertStringContainsString("LOGSECRET", (string) file_get_contents($this->project . "/t.json"));
+
+        $this->writeFile("flows/loop.yml", "id: loop\nblocks:\n  main:\n    steps:\n      spin:\n        jump: main.spin\n");
+        $this->writeJson("doubles.json", ["doubles" => [], "budget" => ["transfers" => 3]]);
+        $this->cli(["flows/loop.yml", "--simulate", "doubles.json", "--trace", "s.json", "--trace-messages"]);
+        $this->assertStringContainsString("budget exhausted", $this->readJson("s.json")["result"]["error"]["message"]);
+    }
+
     /**
      * @return array<string, array{0: list<string>, 1: string}>
      */
@@ -513,6 +540,7 @@ blocks:
             "with --root" => [array_merge($sim, ["--root", "functions"]), "--root cannot be used with --simulate"],
             "php flow" => [["flows/hello.php", "--simulate", "doubles.json"], "--simulate runs YAML flows only"],
             "session without simulate" => [["flows/invoice.yml", "--session", "s.json"], "--session needs --simulate"],
+            "trace messages without trace" => [array_merge($sim, ["--trace-messages"]), "--trace-messages needs --trace"],
             "context and existing session" => [array_merge($sim, ["--session", "session.json", "--context", "context.json"]),
                 "--context cannot be used to resume"],
             "trace over context" => [array_merge($sim, ["--context", "context.json", "--trace", "context.json"]),

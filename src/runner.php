@@ -61,6 +61,7 @@ final class runner
         "max_depth" => 8,
         "max_nodes" => 2000,
         "capture_values" => true,
+        "capture_messages" => false,
         "redact_keys" => [],
         "exclude_keys" => [],
     ];
@@ -69,6 +70,25 @@ final class runner
      * Simulation budget defaults: entered steps, control transfers (calls and
      * jumps) and wall-clock seconds of one simulated invocation.
      */
+    /**
+     * Smallest accepted `max_bytes`. A quarter of `max_bytes` is held back for
+     * the forced events (`budget.exhausted`, `run.end`, `trace.truncated`),
+     * and their compact forms always fit in it.
+     */
+    private const TRACE_MIN_BYTES = 8192;
+
+    /**
+     * Events a trace keeps even when full, once each.
+     */
+    private const TRACE_FORCED = ["budget.exhausted", "run.end", "trace.truncated"];
+
+    /**
+     * Event fields a trace replaces with a marker when an event does not fit
+     * in the bytes left; the compact form of a forced event also drops these.
+     */
+    private const TRACE_BULKY = ["context", "changes", "result", "value"];
+    private const TRACE_BULKY_FORCED = ["checkpoint"];
+
     private const BUDGET_DEFAULTS = ["steps" => 10000, "transfers" => 10000, "seconds" => 10.0];
 
     /**
@@ -547,8 +567,9 @@ final class runner
      *
      * Options: those of `run()`, plus `trace` (caps and value capture:
      * `max_events`, `max_bytes`, `max_string`, `max_items`, `max_depth`,
-     * `max_nodes`, `capture_values`, `redact_keys`, `redact_defaults`,
-     * `exclude_keys`).
+     * `max_nodes`, `capture_values`, `capture_messages`, `redact_keys`,
+     * `redact_defaults`, `exclude_keys`). Error and log messages are left out
+     * of the trace unless `capture_messages` is true.
      *
      * Unlike `run()`, setup errors (unreadable or invalid flow) are not thrown:
      * they are recorded in the context and in the trace result.
@@ -568,6 +589,11 @@ final class runner
         $trace = self::newTrace("run", $traceOptions, null);
         if (is_string($flow) && is_file($flow)) {
             $trace["sources"]["flow"] = self::fileSource("flow", $flow, $flow);
+        }
+        try {
+            $trace["sources"] += self::functionMapSource($options["function_map"] ?? []);
+        } catch (RuntimeException $e) {
+            // An invalid map is a setup error of the run, recorded in the trace.
         }
         $fingerprint = self::fingerprint($trace["sources"]);
 
@@ -596,8 +622,8 @@ final class runner
      * Options: `budget` (`steps`, `transfers`, `seconds`), `cancel` (callable
      * returning true to stop), `double_calls` (calls made so far per double,
      * from a previous trace, to resume), `fingerprint` (expected fingerprint:
-     * refuse to resume if the flow, doubles or nested flows changed), `trace`,
-     * `function_map`, `logger`, `shared_context`.
+     * refuse to resume if the flow, doubles, nested flows or `function_map`
+     * changed), `trace`, `function_map`, `logger`, `shared_context`.
      *
      * @param array<string, mixed> $context
      * @param array<string, mixed> $doubles
@@ -650,11 +676,16 @@ final class runner
                 $trace["sources"]["nested_flow:" . $name] = self::fileSource("nested_flow", $name, $double["path"]);
             }
         }
+        try {
+            $trace["sources"] += self::functionMapSource($simulation["function_map"]);
+        } catch (RuntimeException $e) {
+            throw new InvalidArgumentException($e->getMessage(), 0, $e);
+        }
 
         $fingerprint = self::fingerprint($trace["sources"]);
         if (isset($options["fingerprint"]) && $options["fingerprint"] !== $fingerprint) {
             throw new InvalidArgumentException(
-                "[divengine.runner] The flow, its doubles or its nested flows changed: expected fingerprint "
+                "[divengine.runner] The flow, its doubles, its nested flows or its function_map changed: expected fingerprint "
                 . (is_string($options["fingerprint"]) ? $options["fingerprint"] : "?") . ", found {$fingerprint}."
             );
         }
@@ -3092,6 +3123,8 @@ final class runner
             "bytes" => 0,
             "truncated" => null,
             "dropped" => 0,
+            "compacted" => 0,
+            "forced" => [],
             "sources" => [],
             "last_function" => null,
             "phase" => null,
@@ -3138,10 +3171,8 @@ final class runner
             "budget" => $simulation !== null ? $simulation["budget"] : null,
             "result" => $trace["result"],
             "simulation" => $simulation !== null ? ["double_calls" => $simulation["calls"]] : null,
-            "truncated" => $trace["truncated"] !== null,
-            "truncation" => $trace["truncated"] !== null
-                ? ["reason" => $trace["truncated"], "dropped_events" => $trace["dropped"]]
-                : null,
+            "truncated" => self::traceIsTruncated($trace),
+            "truncation" => self::traceIsTruncated($trace) ? self::traceTruncation($trace) : null,
             "events" => $trace["events"],
             "meta" => [
                 "started_at" => $trace["started_at"],
@@ -3152,8 +3183,15 @@ final class runner
     }
 
     /**
-     * Appends an event unless the trace is full. Forced events (run end,
-     * budget exhaustion, truncation notice) are always kept.
+     * Appends an event unless the trace is full.
+     *
+     * The kept events never exceed `max_bytes` (one compact JSON line each).
+     * Ordinary events use at most three quarters of it; an event that does not
+     * fit in what is left has its bulky fields replaced by markers, and is
+     * dropped if it still does not fit, which ends the trace. Forced events
+     * (`TRACE_FORCED`, once each) use the last quarter and are compacted
+     * further until they fit, so `run.end` is always present. Forced events
+     * may exceed `max_events` by up to three.
      *
      * @param array<string, mixed> $data
      * @param array<string, mixed> $context
@@ -3163,7 +3201,12 @@ final class runner
         if (self::$trace === null) {
             return;
         }
-        if (self::$trace["truncated"] !== null && !$force) {
+        if ($force) {
+            $force = in_array($type, self::TRACE_FORCED, true) && !isset(self::$trace["forced"][$type]);
+        }
+        $options = self::$trace["options"];
+        if (!$force && (self::$trace["truncated"] !== null || count(self::$trace["events"]) >= $options["max_events"])) {
+            self::$trace["truncated"] ??= "max_events";
             self::$trace["dropped"]++;
             return;
         }
@@ -3177,26 +3220,68 @@ final class runner
             "flow_depth" => max(0, $flowDepth - 1),
             "call_depth" => $callDepth,
         ] + $data;
-        $size = strlen((string) json_encode($event, self::TRACE_JSON)) + 1;
 
-        if (!$force) {
-            $options = self::$trace["options"];
-            $reason = null;
-            if (count(self::$trace["events"]) >= $options["max_events"]) {
-                $reason = "max_events";
-            } elseif (self::$trace["bytes"] + $size > $options["max_bytes"]) {
-                $reason = "max_bytes";
+        $limit = $force ? $options["max_bytes"] : $options["max_bytes"] - intdiv($options["max_bytes"], 4);
+        $room = $limit - self::$trace["bytes"];
+        $size = self::traceSize($event);
+        if ($size > $room) {
+            $event = self::traceCompact($event, self::TRACE_BULKY);
+            $size = self::traceSize($event);
+            if ($size > $room && $force) {
+                $event = self::traceCompact($event, self::TRACE_BULKY_FORCED, true);
+                $size = self::traceSize($event);
             }
-            if ($reason !== null) {
-                self::$trace["truncated"] = $reason;
+            if ($size > $room) {
+                // Only an ordinary event can get here: compact forced events
+                // fit in the quarter held back (TRACE_MIN_BYTES).
+                self::$trace["truncated"] ??= "max_bytes";
                 self::$trace["dropped"]++;
                 return;
             }
+            self::$trace["compacted"]++;
         }
 
+        if ($force) {
+            self::$trace["forced"][$type] = true;
+        }
         self::$trace["seq"]++;
         self::$trace["events"][] = $event;
         self::$trace["bytes"] += $size;
+    }
+
+    /**
+     * @param array<string, mixed> $event
+     */
+    private static function traceSize(array $event): int
+    {
+        return strlen((string) json_encode($event, self::TRACE_JSON)) + 1;
+    }
+
+    /**
+     * Replaces the given fields of an event with `max_bytes` markers; with
+     * `$minimal`, also the error message, and cuts the error class.
+     *
+     * @param array<string, mixed> $event
+     * @param list<string>         $fields
+     *
+     * @return array<string, mixed>
+     */
+    private static function traceCompact(array $event, array $fields, bool $minimal = false): array
+    {
+        $marker = ['$type' => "truncated", "reason" => "max_bytes"];
+        foreach ($fields as $field) {
+            if (!array_key_exists($field, $event)) {
+                continue;
+            }
+            $event[$field] = $field === "changes"
+                ? [$marker + ["count" => is_array($event[$field]) ? count($event[$field]) : 0]]
+                : $marker;
+        }
+        if ($minimal && is_array($event["error"] ?? null)) {
+            $event["error"]["class"] = self::utf8Prefix((string) $event["error"]["class"], 200);
+            $event["error"]["message"] = $marker;
+        }
+        return $event;
     }
 
     /**
@@ -3249,12 +3334,34 @@ final class runner
             "context" => self::traceSnapshot($context),
         ], $context, true);
 
-        if (self::$trace["truncated"] !== null) {
-            self::traceEvent("trace.truncated", [
-                "reason" => self::$trace["truncated"],
-                "dropped_events" => self::$trace["dropped"],
-            ], $context, true);
+        if (self::traceIsTruncated(self::$trace)) {
+            self::traceEvent("trace.truncated", self::traceTruncation(self::$trace), $context, true);
         }
+    }
+
+    /**
+     * @param array<string, mixed> $trace
+     */
+    private static function traceIsTruncated(array $trace): bool
+    {
+        return $trace["truncated"] !== null || $trace["compacted"] > 0;
+    }
+
+    /**
+     * Why and how much of the trace was cut: events dropped once it was full,
+     * and kept events whose bulky fields became `max_bytes` markers.
+     *
+     * @param array<string, mixed> $trace
+     *
+     * @return array{reason: string, dropped_events: int, compacted_events: int}
+     */
+    private static function traceTruncation(array $trace): array
+    {
+        return [
+            "reason" => $trace["truncated"] ?? "max_bytes",
+            "dropped_events" => $trace["dropped"],
+            "compacted_events" => $trace["compacted"],
+        ];
     }
 
     /**
@@ -3299,16 +3406,31 @@ final class runner
     }
 
     /**
-     * @return array{class: string, message: string}
+     * @return array{class: string, message: string|array{"$type": string}}
      */
     private static function traceError(Throwable $e): array
     {
-        $message = $e->getMessage();
-        $max = self::$trace["options"]["max_string"] ?? 1024;
-        if (strlen($message) > $max) {
-            $message = self::utf8Prefix($message, $max) . "...";
+        return ["class" => get_class($e), "message" => self::traceMessage($e->getMessage())];
+    }
+
+    /**
+     * An error or log message as the trace keeps it: a redaction marker
+     * unless `capture_messages` is set, then capped by `max_string`.
+     * Messages are free text and may hold any value, so key-based redaction
+     * cannot protect them.
+     *
+     * @return string|array{"$type": string}
+     */
+    private static function traceMessage(string $message): string|array
+    {
+        $options = self::$trace["options"] ?? self::TRACE_DEFAULTS;
+        if (!$options["capture_messages"]) {
+            return ['$type' => "redacted"];
         }
-        return ["class" => get_class($e), "message" => $message];
+        if (strlen($message) > $options["max_string"]) {
+            return self::utf8Prefix($message, $options["max_string"]) . "...";
+        }
+        return $message;
     }
 
     /**
@@ -3321,13 +3443,12 @@ final class runner
         return function (string $level, string $message, array $logContext = []) use ($logger, &$context): void {
             $logger($level, $message, $logContext);
             if (self::$trace !== null && !str_starts_with($message, "[divengine.runner]")) {
-                $max = self::$trace["options"]["max_string"];
                 self::traceEvent("log", [
                     "call_depth" => self::$trace["function_call_depth"] ?? count(self::flowStack($context)),
                     "block" => self::currentBlock($context),
                     "step" => is_string($context["_current_step_id"] ?? null) ? $context["_current_step_id"] : null,
                     "level" => $level,
-                    "message" => strlen($message) > $max ? self::utf8Prefix($message, $max) . "..." : $message,
+                    "message" => self::traceMessage($message),
                 ], $context);
             }
         };
@@ -3365,7 +3486,8 @@ final class runner
 
     /**
      * Fingerprint of the sources known before a run: the flow, and in a
-     * simulation its doubles and nested flows. Paths do not take part.
+     * simulation its doubles and nested flows, and a non-empty `function_map`.
+     * Paths do not take part.
      *
      * @param array<string, array<string, mixed>> $sources
      */
@@ -3378,6 +3500,31 @@ final class runner
         sort($parts);
 
         return "sha256:" . hash("sha256", (string) json_encode([self::TRACE_VERSION, $parts]));
+    }
+
+    /**
+     * The `function_map` option as a source: it decides which function each
+     * reference resolves to, so a changed map changes the fingerprint. An
+     * empty map is no source, as if the option were absent.
+     *
+     * @return array<string, array{role: string, name: string, path: null, sha256: string}>
+     *
+     * @throws RuntimeException On an invalid map.
+     */
+    private static function functionMapSource(mixed $map): array
+    {
+        $normalized = self::normalizeFunctionMap($map);
+        if ($normalized === []) {
+            return [];
+        }
+        ksort($normalized, SORT_STRING);
+
+        return ["function_map" => [
+            "role" => "function_map",
+            "name" => "function_map",
+            "path" => null,
+            "sha256" => hash("sha256", self::canonicalJson($normalized)),
+        ]];
     }
 
     private static function canonicalJson(mixed $value): string
@@ -3405,7 +3552,9 @@ final class runner
     }
 
     /**
-     * Business keys of the context (not `_`-prefixed), as trace values.
+     * Business keys of the context (not `_`-prefixed), as trace values. Keys
+     * share one `max_nodes` allowance; keys past it and keys longer than
+     * `max_string` are counted in `$more`.
      *
      * @param array<string, mixed> $context
      *
@@ -3413,13 +3562,22 @@ final class runner
      */
     private static function traceSnapshot(array $context): array
     {
-        $nodes = self::$trace["options"]["max_nodes"] ?? 0;
+        $options = self::$trace["options"] ?? self::TRACE_DEFAULTS;
+        $nodes = $options["max_nodes"];
         $snapshot = [];
+        $more = 0;
         foreach ($context as $key => $value) {
-            if ((is_string($key) && str_starts_with($key, "_")) || self::isExcludedKey($key)) {
+            if (!self::isBusinessKey($key, $options)) {
+                continue;
+            }
+            if ($nodes <= 0 || self::isLongKey($key, $options)) {
+                $more++;
                 continue;
             }
             $snapshot[$key] = self::traceValue($value, $key, $nodes);
+        }
+        if ($more > 0) {
+            $snapshot['$more'] = $more;
         }
 
         return $snapshot;
@@ -3427,6 +3585,9 @@ final class runner
 
     /**
      * Changes of business keys between two contexts, in key order of `$after`.
+     * Changes share one `max_nodes` allowance; changes past it and changes of
+     * keys longer than `max_string` are counted in a final
+     * `{"$type": "more", "count": n}` item.
      *
      * @param array<string, mixed> $before
      * @param array<string, mixed> $after
@@ -3435,15 +3596,23 @@ final class runner
      */
     private static function traceChanges(array $before, array $after): array
     {
-        $nodes = self::$trace["options"]["max_nodes"] ?? 0;
+        if (self::$trace === null || self::$trace["truncated"] !== null) {
+            return []; // The event that would hold them is dropped.
+        }
+        $options = self::$trace["options"];
+        $nodes = $options["max_nodes"];
         $changes = [];
+        $more = 0;
         foreach ($after as $key => $value) {
-            if ((is_string($key) && str_starts_with($key, "_")) || self::isExcludedKey($key)) {
+            if (!self::isBusinessKey($key, $options)
+                || (array_key_exists($key, $before) && $before[$key] === $value)) {
                 continue;
             }
-            if (!array_key_exists($key, $before)) {
+            if ($nodes <= 0 || self::isLongKey($key, $options)) {
+                $more++;
+            } elseif (!array_key_exists($key, $before)) {
                 $changes[] = ["key" => $key, "op" => "added", "after" => self::traceValue($value, $key, $nodes)];
-            } elseif ($before[$key] !== $value) {
+            } else {
                 $changes[] = [
                     "key" => $key,
                     "op" => "changed",
@@ -3453,15 +3622,38 @@ final class runner
             }
         }
         foreach ($before as $key => $value) {
-            if ((is_string($key) && str_starts_with($key, "_")) || self::isExcludedKey($key)) {
+            if (!self::isBusinessKey($key, $options) || array_key_exists($key, $after)) {
                 continue;
             }
-            if (!array_key_exists($key, $after)) {
+            if ($nodes-- <= 0 || self::isLongKey($key, $options)) {
+                $more++; // A removal holds no value but still costs a node.
+            } else {
                 $changes[] = ["key" => $key, "op" => "removed"];
             }
         }
+        if ($more > 0) {
+            $changes[] = ['$type' => "more", "count" => $more];
+        }
 
         return $changes;
+    }
+
+    /**
+     * @param array<string, mixed> $options
+     */
+    private static function isBusinessKey(int|string $key, array $options): bool
+    {
+        return !(is_string($key) && str_starts_with($key, "_")) && !self::isExcludedKey($key, $options);
+    }
+
+    /**
+     * Keys longer than `max_string` are left out of trace values and counted.
+     *
+     * @param array<string, mixed> $options
+     */
+    private static function isLongKey(int|string $key, array $options): bool
+    {
+        return is_string($key) && strlen($key) > $options["max_string"];
     }
 
     /**
@@ -3528,8 +3720,11 @@ final class runner
                     $skipped++;
                     continue;
                 }
-                if ($kept >= $options["max_items"]) {
+                if ($kept >= $options["max_items"] || $nodes <= 0) {
                     break;
+                }
+                if (self::isLongKey($itemKey, $options)) {
+                    continue; // Counted in `$more` below.
                 }
                 $out[$itemKey] = self::traceNode($item, $itemKey, $depth + 1, $nodes, $options);
                 $kept++;
@@ -3605,7 +3800,12 @@ final class runner
                 throw new InvalidArgumentException("[divengine.runner] Trace option '{$key}' must be a positive integer.");
             }
         }
-        foreach (["capture_values", "redact_defaults"] as $key) {
+        if ($options["max_bytes"] < self::TRACE_MIN_BYTES) {
+            throw new InvalidArgumentException(
+                "[divengine.runner] Trace option 'max_bytes' must be at least " . self::TRACE_MIN_BYTES . "."
+            );
+        }
+        foreach (["capture_values", "capture_messages", "redact_defaults"] as $key) {
             if (!is_bool($options[$key])) {
                 throw new InvalidArgumentException("[divengine.runner] Trace option '{$key}' must be a boolean.");
             }

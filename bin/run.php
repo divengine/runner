@@ -18,6 +18,7 @@
  * - `--trace <file>` writes a semantic trace (`runner::runTraced()`), and
  *   `--simulate <doubles.json>` simulates a YAML flow with test doubles
  *   (`runner::simulate()`); neither changes stdout or the exit codes.
+ *   `--trace-messages` keeps error and log messages in the trace.
  *
  * Relative paths (flow, --context, --root, --save-context) are relative to the
  * current working directory.
@@ -62,6 +63,8 @@ function usage(): string
           --save-context <file>  Write the resulting context as JSON (atomic replace).
           --json                 Print the resulting context as JSON instead of the state.
           --trace <file>         Write a semantic trace of the run as JSON (atomic replace).
+          --trace-messages       Keep error and log messages in the trace (left out by
+                                 default: they may hold sensitive data).
           --simulate <file>      Simulate a YAML flow with the test doubles in this JSON file;
                                  no function file is loaded.
           --session <file>       Simulation state: resumed when the file exists, then rewritten.
@@ -84,13 +87,14 @@ function usage(): string
  * @param list<string> $args Arguments without the script name.
  *
  * @return array{flow: string, context: ?string, root: ?string, save: ?string, trace: ?string,
- *     simulate: ?string, session: ?string, json: bool, help: bool}
+ *     simulate: ?string, session: ?string, json: bool, trace_messages: bool, help: bool}
  */
 function parseArguments(array $args): array
 {
     $options = [
         "flow" => null, "context" => null, "root" => null, "save" => null,
-        "trace" => null, "simulate" => null, "session" => null, "json" => false, "help" => false,
+        "trace" => null, "simulate" => null, "session" => null, "json" => false, "trace_messages" => false,
+        "help" => false,
     ];
     $valueOptions = [
         "context" => "context", "root" => "root", "save-context" => "save",
@@ -113,6 +117,11 @@ function parseArguments(array $args): array
 
         if (!$onlyPositional && $arg === "--json") {
             $options["json"] = true;
+            continue;
+        }
+
+        if (!$onlyPositional && $arg === "--trace-messages") {
+            $options["trace_messages"] = true;
             continue;
         }
 
@@ -482,6 +491,9 @@ function main(array $argv): int
         if (!$simulate && $options["session"] !== null) {
             throw new UsageError("--session needs --simulate");
         }
+        if ($options["trace_messages"] && $options["trace"] === null) {
+            throw new UsageError("--trace-messages needs --trace");
+        }
         if ($simulate) {
             if ($extension === "php") {
                 throw new UsageError("--simulate runs YAML flows only: {$options["flow"]}");
@@ -550,11 +562,11 @@ function main(array $argv): int
         if ($spec !== null) {
             $trace = runner::simulate($flow, $context, $spec["doubles"], [
                 "budget" => $spec["budget"],
-                "trace" => $spec["trace"],
+                "trace" => $options["trace_messages"] ? ["capture_messages" => true] + $spec["trace"] : $spec["trace"],
                 "double_calls" => $session["double_calls"] ?? [],
             ] + ($session !== null ? ["fingerprint" => $session["fingerprint"]] : []));
         } elseif ($traceTarget !== null) {
-            $trace = runner::runTraced($flow, $context);
+            $trace = runner::runTraced($flow, $context, $options["trace_messages"] ? ["trace" => ["capture_messages" => true]] : []);
         } else {
             runner::run($flow, $context);
         }

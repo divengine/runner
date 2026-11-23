@@ -440,12 +440,17 @@ final class TraceTest extends TestCase
     public function testByteCapTruncates(): void
     {
         $context = [];
-        $trace = runner::simulate(self::FLOWS . "/ordinary.yml", $context, $this->doubles(), ["trace" => ["max_bytes" => 400]]);
+        $doubles = $this->doubles(["produce" => ["returns" => str_repeat("x", 1000)]]);
+        $trace = runner::simulate(self::FLOWS . "/loop.yml", $context, $doubles, ["trace" => ["max_bytes" => 8192]]);
 
         $this->assertSame("max_bytes", $trace["truncation"]["reason"]);
-        $this->assertSame("done", $trace["result"]["state"]);
-        $kept = array_slice($trace["events"], 0, -2);
-        $this->assertLessThanOrEqual(400, strlen((string) json_encode($kept)));
+        $this->assertGreaterThan(0, $trace["truncation"]["dropped_events"]);
+        $this->assertSame(["run.end", "trace.truncated"], array_column(array_slice($trace["events"], -2), "type"));
+        $this->assertLessThanOrEqual(8192, $this->eventBytes($trace));
+        $ordinary = array_values(array_filter($trace["events"],
+            fn (array $e): bool => !in_array($e["type"], ["budget.exhausted", "run.end", "trace.truncated"], true)));
+        $this->assertLessThanOrEqual(8192 - 2048, $this->eventBytes($trace, $ordinary),
+            "ordinary events leave a quarter of max_bytes to the forced ones");
     }
 
     public function testValuesAreBoundedJsonSafeAndRedacted(): void
@@ -468,11 +473,11 @@ final class TraceTest extends TestCase
             "map" => ["a" => 1, "b" => 2, "c" => 3, "d" => 4, "e" => 5],
             "recursive" => $recursive,
             "nested" => ["user" => ["Password" => "p", "name" => "n", "hidden" => "h"]],
-            "custom_pin" => "1234",
+            "pin" => "1234",
         ];
 
         $trace = runner::simulate(self::FLOWS . "/ordinary.yml", $context, $this->doubles(), ["trace" => [
-            "max_string" => 9, "max_items" => 3, "max_depth" => 3, "redact_keys" => ["CUSTOM_PIN"], "exclude_keys" => ["hidden"],
+            "max_string" => 9, "max_items" => 3, "max_depth" => 3, "redact_keys" => ["PIN"], "exclude_keys" => ["hidden"],
         ]]);
         $snapshot = $trace["events"][0]["context"];
 
@@ -492,7 +497,7 @@ final class TraceTest extends TestCase
             "max_depth 3 keeps three array levels; the recursion stops there"
         );
         $this->assertSame(["user" => ["Password" => ['$type' => "redacted"], "name" => "n"]], $snapshot["nested"]);
-        $this->assertSame(['$type' => "redacted"], $snapshot["custom_pin"]);
+        $this->assertSame(['$type' => "redacted"], $snapshot["pin"]);
         $this->assertNotFalse(json_encode($trace));
         fclose($handle);
     }
@@ -505,7 +510,7 @@ final class TraceTest extends TestCase
         ]);
 
         $encoded = (string) json_encode($trace["events"][0]["context"]);
-        $this->assertStringContainsString('{"$type":"truncated"}', $encoded);
+        $this->assertStringContainsString('{"$type":"more","count":49}', $encoded, "items past max_nodes are counted");
         $this->assertLessThan(2000, strlen($encoded));
     }
 
@@ -523,7 +528,9 @@ final class TraceTest extends TestCase
     {
         $this->writeFunction("talk", 'return function (array &$context): void { $context["_logger"]("INFO", "hello from talk"); };');
         $context = ["_root_folder" => $this->dir . "/functions"];
-        $trace = runner::runTraced($this->writeFlow("talk", "main:\n    steps:\n      speak:\n        activity: talk\n"), $context);
+        $trace = runner::runTraced($this->writeFlow("talk", "main:\n    steps:\n      speak:\n        activity: talk\n"), $context, [
+            "trace" => ["capture_messages" => true],
+        ]);
 
         $logs = $this->eventsOfType($trace, "log");
         $this->assertCount(1, $logs);
@@ -620,6 +627,8 @@ final class TraceTest extends TestCase
             [["budget" => ["loops" => 1]], "Unknown simulation budget"],
             [["trace" => ["max_events" => "10"]], "positive integer"],
             [["trace" => ["unknown" => 1]], "Unknown trace option"],
+            [["trace" => ["capture_messages" => 1]], "must be a boolean"],
+            [["trace" => ["max_bytes" => 8191]], "at least 8192"],
             [["unknown" => 1], "Unknown simulation option"],
             [["cancel" => "not callable at all"], "must be callable"],
             [["double_calls" => ["f" => -1]], "call counts"],
@@ -637,6 +646,254 @@ final class TraceTest extends TestCase
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // Messages: redacted unless captured explicitly
+    // ------------------------------------------------------------------
+
+    public function testErrorAndLogMessagesAreRedactedByDefault(): void
+    {
+        $this->writeFunction("leak", 'return function (array &$context): void { $context["_logger"]("WARNING", "retrying with token=tk-LOGSECRET"); throw new RuntimeException("login failed for password=pw-ERRSECRET"); };');
+        $logged = [];
+        $context = ["_root_folder" => $this->dir . "/functions"];
+        $trace = runner::runTraced($this->writeFlow("leak", "main:\n    steps:\n      go:\n        activity: leak\n"), $context, [
+            "logger" => function (string $level, string $message) use (&$logged): void {
+                $logged[] = $message;
+            },
+        ]);
+
+        $encoded = (string) json_encode($trace);
+        $this->assertStringNotContainsString("LOGSECRET", $encoded);
+        $this->assertStringNotContainsString("ERRSECRET", $encoded);
+        $redacted = ['$type' => "redacted"];
+        $this->assertSame(["class" => "RuntimeException", "message" => $redacted], $trace["result"]["error"]);
+        $this->assertSame($redacted, $this->eventsOfType($trace, "activity.error")[0]["error"]["message"]);
+        $this->assertSame($redacted, $this->eventsOfType($trace, "log")[0]["message"]);
+        $this->assertSame("WARNING", $this->eventsOfType($trace, "log")[0]["level"]);
+        $this->assertFalse($trace["limits"]["capture_messages"]);
+
+        // Normal Runner logging and error reporting are unchanged.
+        $this->assertContains("retrying with token=tk-LOGSECRET", $logged);
+        $this->assertStringContainsString("ERRSECRET", $context["_runner_result"]);
+        $this->assertStringContainsString("ERRSECRET", (string) json_encode($context["_runner_logs"]));
+    }
+
+    public function testSimulationMessagesAreRedactedByDefault(): void
+    {
+        $context = [];
+        $trace = runner::simulate(self::FLOWS . "/failure.yml", $context, $this->doubles(["fail" => ["throws" => "secret=DOUBLESECRET"]]));
+
+        $this->assertStringNotContainsString("DOUBLESECRET", (string) json_encode($trace));
+        $this->assertSame(['$type' => "redacted"], $trace["result"]["error"]["message"]);
+    }
+
+    public function testMessagesAreCapturedOnlyOnRequestAndCapped(): void
+    {
+        $this->writeFunction("leak", 'return function (array &$context): void { $context["_logger"]("INFO", "a log message that is long"); throw new RuntimeException("an error message that is long"); };');
+        $context = ["_root_folder" => $this->dir . "/functions"];
+        $trace = runner::runTraced($this->writeFlow("leak", "main:\n    steps:\n      go:\n        activity: leak\n"), $context, [
+            "trace" => ["capture_messages" => true, "max_string" => 16],
+        ]);
+
+        $this->assertSame("an error message...", $trace["result"]["error"]["message"]);
+        $this->assertSame("a log message th...", $this->eventsOfType($trace, "log")[0]["message"]);
+        $this->assertTrue($trace["limits"]["capture_messages"]);
+    }
+
+    // ------------------------------------------------------------------
+    // function_map takes part in the fingerprint
+    // ------------------------------------------------------------------
+
+    public function testFunctionMapTakesPartInTheFingerprint(): void
+    {
+        $doubles = $this->doubles(["produce_v2" => ["returns" => "v2"], "produce_v3" => ["returns" => "v3"]]);
+        $fingerprint = function (array $options) use ($doubles): string {
+            $context = [];
+            return runner::simulate(self::FLOWS . "/ordinary.yml", $context, $doubles, $options)["fingerprint"];
+        };
+
+        $none = $fingerprint([]);
+        $v2 = $fingerprint(["function_map" => ["produce" => "produce_v2"]]);
+        $this->assertSame($none, $fingerprint(["function_map" => []]), "an empty map is no map");
+        $this->assertNotSame($none, $v2);
+        $this->assertNotSame($v2, $fingerprint(["function_map" => ["produce" => "produce_v3"]]));
+        $this->assertSame($v2, $fingerprint(["function_map" => [" produce " => " produce_v2 "]]), "the normalized map counts");
+
+        $context = [];
+        $trace = runner::simulate(self::FLOWS . "/ordinary.yml", $context, $doubles, ["function_map" => ["produce" => "produce_v2"]]);
+        $this->assertSame("v2", $context["first"], "the map changes what runs");
+        $roles = array_column($trace["sources"], "role");
+        $this->assertContains("function_map", $roles);
+    }
+
+    public function testResumeRefusesAChangedFunctionMap(): void
+    {
+        $doubles = $this->doubles(["consume_v2" => ["returns" => "v2"]]);
+        $context = [];
+        $first = runner::simulate(self::FLOWS . "/activity_pause.yml", $context, $doubles);
+        $this->assertSame("paused", $context["_runner_state"]);
+        $paused = $context;
+
+        try {
+            runner::simulate(self::FLOWS . "/activity_pause.yml", $context, $doubles, [
+                "double_calls" => $first["simulation"]["double_calls"],
+                "fingerprint" => $first["fingerprint"],
+                "function_map" => ["consume" => "consume_v2"],
+            ]);
+            $this->fail("expected InvalidArgumentException");
+        } catch (InvalidArgumentException $e) {
+            $this->assertStringContainsString("function_map changed", $e->getMessage());
+        }
+        $this->assertSame($paused, $context, "a refused resume runs nothing");
+
+        runner::simulate(self::FLOWS . "/activity_pause.yml", $context, $doubles, [
+            "double_calls" => $first["simulation"]["double_calls"],
+            "fingerprint" => $first["fingerprint"],
+        ]);
+        $this->assertSame("done", $context["_runner_state"]);
+    }
+
+    public function testAnInvalidFunctionMapIsRejectedBeforeSimulating(): void
+    {
+        $context = ["untouched" => true];
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage("function_map");
+        runner::simulate(self::FLOWS . "/ordinary.yml", $context, $this->doubles(), ["function_map" => ["produce" => ""]]);
+    }
+
+    public function testTracedRunFingerprintCoversItsFunctionMap(): void
+    {
+        $this->writeFunction("produce_v2", 'return fn (array &$context): string => "v2";');
+        $a = ["_root_folder" => $this->dir . "/functions"];
+        $b = $a;
+        $plain = runner::runTraced(self::FLOWS . "/ordinary.yml", $a);
+        $mapped = runner::runTraced(self::FLOWS . "/ordinary.yml", $b, ["function_map" => ["produce" => "produce_v2"]]);
+
+        $this->assertNotSame($plain["fingerprint"], $mapped["fingerprint"]);
+        $this->assertSame("v2", $b["first"]);
+    }
+
+    // ------------------------------------------------------------------
+    // Strict size bounds
+    // ------------------------------------------------------------------
+
+    public function testHugeContextKeepsTheTraceWithinMaxBytes(): void
+    {
+        $context = ["_root_folder" => $this->dir . "/functions"];
+        for ($i = 0; $i < 5000; $i++) {
+            $context["key{$i}"] = str_repeat("v", 1500);
+        }
+        $plain = $context;
+        runner::run(self::FLOWS . "/ordinary.yml", $plain);
+        $trace = runner::runTraced(self::FLOWS . "/ordinary.yml", $context);
+
+        $this->assertSame($this->comparable($plain), $this->comparable($context), "bounding the trace never changes the run");
+        $this->assertLessThanOrEqual(4194304, $this->eventBytes($trace));
+        $this->assertTrue($trace["truncated"]);
+        $this->assertGreaterThan(0, $trace["truncation"]["compacted_events"]);
+        $this->assertSame("done", $trace["result"]["state"]);
+
+        $start = $this->eventsOfType($trace, "run.start")[0];
+        $end = $this->eventsOfType($trace, "run.end")[0];
+        $this->assertSame(3000, $start["context"]['$more'], "top-level keys past max_nodes are counted, not copied");
+        $this->assertCount(2001, $start["context"]);
+        $this->assertSame(['$type' => "truncated", "reason" => "max_bytes"], $end["context"]);
+        $this->assertSame([], $end["checkpoint"]["flow_state"], "run.end keeps its checkpoint while it fits");
+        $this->assertSame("trace.truncated", $trace["events"][count($trace["events"]) - 1]["type"]);
+    }
+
+    public function testOversizedForcedEventsAreCompactedToFit(): void
+    {
+        $context = ["blob" => str_repeat("b", 50000)];
+        $doubles = $this->doubles(["fail" => ["throws" => str_repeat("m", 50000)]]);
+        $trace = runner::simulate(self::FLOWS . "/failure.yml", $context, $doubles, ["trace" => [
+            "max_bytes" => 8192, "max_string" => 1000000, "capture_messages" => true,
+        ]]);
+
+        $this->assertLessThanOrEqual(8192, $this->eventBytes($trace));
+        $end = $this->eventsOfType($trace, "run.end")[0];
+        $marker = ['$type' => "truncated", "reason" => "max_bytes"];
+        $this->assertSame($marker, $end["context"]);
+        $this->assertSame($marker, $end["checkpoint"]);
+        $this->assertSame(["class" => "RuntimeException", "message" => $marker], $end["error"]);
+        $this->assertSame("error", $end["state"]);
+        $this->assertSame("trace.truncated", $trace["events"][count($trace["events"]) - 1]["type"]);
+        $this->assertSame($marker, $this->eventsOfType($trace, "run.start")[0]["context"]);
+    }
+
+    public function testManyChangesAreCountedPastMaxNodes(): void
+    {
+        $added = [];
+        for ($i = 0; $i < 5000; $i++) {
+            $added["k{$i}"] = $i;
+        }
+        $context = [];
+        $trace = runner::simulate(self::FLOWS . "/ordinary.yml", $context, $this->doubles([
+            "produce" => ["returns" => 1, "context" => $added],
+        ]), ["trace" => ["max_nodes" => 100]]);
+
+        $changes = $this->eventsOfType($trace, "activity.end")[0]["changes"];
+        $this->assertCount(101, $changes);
+        $this->assertSame(['$type' => "more", "count" => 4900 + 1], $changes[100], "the result key of the step is counted too");
+    }
+
+    public function testLongKeysAreCountedNotCopied(): void
+    {
+        $long = str_repeat("k", 2000);
+        $context = [$long => 1, "short" => [$long => 2, "ok" => 3]];
+        $trace = runner::simulate(self::FLOWS . "/ordinary.yml", $context, $this->doubles());
+
+        $snapshot = $trace["events"][0]["context"];
+        $this->assertSame(["short" => ["ok" => 3, '$more' => 1], '$more' => 1], $snapshot);
+        $this->assertStringNotContainsString($long, (string) json_encode($trace));
+    }
+
+    /**
+     * @return iterable<string, array{int, string}>
+     */
+    public static function boundedTraces(): iterable
+    {
+        foreach ([8192, 9000, 16384, 65536, 200000] as $bytes) {
+            foreach (["loop", "big_context", "big_results", "failure"] as $shape) {
+                yield "{$shape} at {$bytes}" => [$bytes, $shape];
+            }
+        }
+    }
+
+    /**
+     * @dataProvider boundedTraces
+     */
+    public function testEventsNeverExceedMaxBytes(int $maxBytes, string $shape): void
+    {
+        $context = [];
+        $doubles = $this->doubles();
+        $flow = "/loop.yml";
+        if ($shape === "big_context") {
+            for ($i = 0; $i < 3000; $i++) {
+                $context["k{$i}"] = str_repeat("c", 300);
+            }
+        } elseif ($shape === "big_results") {
+            $doubles["produce"] = ["returns" => array_fill(0, 200, str_repeat("r", 500))];
+        } elseif ($shape === "failure") {
+            $flow = "/failure.yml";
+            $context["blob"] = str_repeat("b", 3 * $maxBytes);
+            $doubles["fail"] = ["throws" => str_repeat("e", 3 * $maxBytes)];
+        }
+        $trace = runner::simulate(self::FLOWS . $flow, $context, $doubles, [
+            "budget" => ["steps" => 2000],
+            "trace" => ["max_bytes" => $maxBytes, "max_string" => 4 * $maxBytes, "capture_messages" => true],
+        ]);
+
+        $this->assertLessThanOrEqual($maxBytes, $this->eventBytes($trace));
+        $this->assertCount(1, $this->eventsOfType($trace, "run.end"), "run.end is always kept, once");
+        $this->assertLessThanOrEqual(1, count($this->eventsOfType($trace, "budget.exhausted")));
+        if ($trace["truncated"]) {
+            $last = $trace["events"][count($trace["events"]) - 1];
+            $this->assertSame("trace.truncated", $last["type"]);
+            $this->assertSame($trace["truncation"], array_intersect_key($last, $trace["truncation"]));
+        }
+        $this->assertSame(range(1, count($trace["events"])), array_column($trace["events"], "seq"));
+    }
 
     /**
      * @param array<string, mixed> $overrides
@@ -688,6 +945,22 @@ final class TraceTest extends TestCase
     private function eventsOfType(array $trace, string $type): array
     {
         return array_values(array_filter($trace["events"], fn (array $e): bool => $e["type"] === $type));
+    }
+
+    /**
+     * Bytes of events as the trace counts them: one compact JSON line each.
+     *
+     * @param array<string, mixed>              $trace
+     * @param list<array<string, mixed>>|null   $events
+     */
+    private function eventBytes(array $trace, ?array $events = null): int
+    {
+        $bytes = 0;
+        foreach ($events ?? $trace["events"] as $event) {
+            $bytes += strlen((string) json_encode($event, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
+                | JSON_PRESERVE_ZERO_FRACTION | JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR)) + 1;
+        }
+        return $bytes;
     }
 
     /**
