@@ -1,0 +1,10 @@
+id: child
+blocks:
+  main:
+    steps:
+      inner:
+        activity: produce
+      hold:
+        pause: true
+      never:
+        activity: never_runs

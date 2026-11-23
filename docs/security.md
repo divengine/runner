@@ -26,6 +26,18 @@ Runner executes code. Treat everything it runs as trusted application code.
   `runner::run()` with the flow file and the context file it is given; it adds
   no isolation. A context file can set reserved keys such as `_root_folder` and
   `_modules`, so it decides which function files load: treat it as trusted input.
+- **Simulation does not load functions, but it is not a sandbox.**
+  `runner::simulate()` and `--simulate` resolve every condition and activity
+  to a declared double: no function file is required and no callable name is
+  called. The flow and any nested flow named in the doubles are still compiled
+  by Runner and run in the same PHP process. Treat flows and doubles files as
+  trusted inputs; there is no OS isolation.
+- **Traces redact values by key and leave messages out.** Values under
+  secret-looking keys are redacted by default. Error and log messages are free
+  text, so traces replace them with a redaction marker unless
+  `capture_messages` (`--trace-messages`) is set. Context and session files
+  still hold `_runner_error` and `_runner_result` as written (see
+  [tracing-and-simulation.md](tracing-and-simulation.md)).
 - **The context is shared and mutable.** Any activity can read and change any key,
   including reserved ones (`_flow_state`, `_root_folder`, helpers).
 

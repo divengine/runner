@@ -1,0 +1,30 @@
+id: nested_pause
+blocks:
+  main:
+    steps:
+      a1:
+        activity: produce
+      a2:
+        call: b.b1
+      a3:
+        activity: produce
+  b:
+    steps:
+      b1:
+        activity: produce
+      b2:
+        call: c.c1
+      b3:
+        activity: produce
+  c:
+    steps:
+      c1:
+        activity: produce
+      c2:
+        pause: true
+      c3:
+        condition: is_enabled
+        activity: produce
+        jump: b.b3
+      c4:
+        activity: never_runs

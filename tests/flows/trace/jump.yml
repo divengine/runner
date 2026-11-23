@@ -1,0 +1,18 @@
+id: jump
+blocks:
+  main:
+    steps:
+      start:
+        call: sub.
+      never:
+        activity: never_runs
+  sub:
+    steps:
+      work:
+        activity: produce
+      leave:
+        jump: finish.
+  finish:
+    steps:
+      last:
+        activity: consume

@@ -2,19 +2,20 @@
 # Installs divengine/runner into a clean temporary Composer project and runs
 # examples/order against the installed package, comparing its output, both
 # through the PHP API (examples/order/run.php) and through the packaged
-# command-line bootstrap (vendor/divengine/runner/bin/run.php).
+# command-line bootstrap (vendor/divengine/runner/bin/run.php), then traces and
+# simulates it through the installed command line.
 #
 # Usage:
 #   scripts/smoke_install.sh               # package built from `git archive HEAD`
 #                                          # (dist contents: export-ignore applied;
 #                                          # uncommitted changes are not included)
-#   scripts/smoke_install.sh packagist     # composer require divengine/runner:^0.2
-#   scripts/smoke_install.sh packagist '^0.1'
+#   scripts/smoke_install.sh packagist     # composer require divengine/runner:^0.3
+#   scripts/smoke_install.sh packagist '^0.2'
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mode="${1:-local}"
-constraint="${2:-^0.2}"
+constraint="${2:-^0.3}"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -77,9 +78,10 @@ echo "$actual"
 # Command line: pause, then resume from the saved context in a new process.
 # The bootstrap ships since 0.2.0, so a missing bin/run.php fails the test. The
 # only exception is an explicitly requested legacy release (packagist '^0.1').
+installed_version="$(composer --working-dir="$project" show divengine/runner --format=json \
+    | php -r 'echo ltrim(json_decode(stream_get_contents(STDIN), true)["versions"][0] ?? "", "v");')"
+installed="$installed_version"
 if [[ ! -f "$project/vendor/divengine/runner/bin/run.php" ]]; then
-    installed="$(composer --working-dir="$project" show divengine/runner --format=json \
-        | php -r 'echo ltrim(json_decode(stream_get_contents(STDIN), true)["versions"][0] ?? "", "v");')"
     if [[ "$mode" == "packagist" && -n "${2:-}" ]] \
         && php -r 'exit(preg_match("/^\d+\.\d+\.\d+$/", $argv[1]) && version_compare($argv[1], "0.2.0", "<") ? 0 : 1);' "$installed"; then
         echo "cli: skipped, legacy release $installed has no bin/run.php"
@@ -105,4 +107,40 @@ if [[ "$first/$first_exit $second/$second_exit $receipt" != "paused/3 done/0 Tot
     exit 1
 fi
 echo "cli: $first ($first_exit), $second ($second_exit), $receipt"
+
+# Tracing and simulation ship since 0.3.0, so their absence fails the test. The
+# only exception is an explicitly requested older release (packagist '^0.2').
+if ! grep -q "public static function simulate(" "$project/vendor/divengine/runner/src/runner.php"; then
+    if [[ "$mode" == "packagist" && -n "${2:-}" ]] \
+        && php -r 'exit(preg_match("/^\d+\.\d+\.\d+$/", $argv[1]) && version_compare($argv[1], "0.3.0", "<") ? 0 : 1);' "$installed_version"; then
+        echo "trace/simulate: skipped, release $installed_version has no tracing or simulation"
+        echo "smoke install OK ($mode)"
+        exit 0
+    fi
+    echo "installed divengine/runner ${installed_version:-?} has no runner::simulate()" >&2
+    exit 1
+fi
+
+set +e
+"${cli[@]}" --context input.json --root functions --trace trace.json > /dev/null; trace_exit=$?
+cat > doubles.json <<'JSON'
+{"doubles": {"compute_total": {"returns": 25.0}, "needs_review": {"returns": true},
+             "format_receipt": {"returns": "simulated receipt"}}}
+JSON
+sim1="$("${cli[@]}" --simulate doubles.json --context input.json --session session.json)"; sim1_exit=$?
+sim2="$("${cli[@]}" --simulate doubles.json --session session.json --trace sim.json)"; sim2_exit=$?
+set -e
+
+summary="$(php -r '
+    $trace = json_decode(file_get_contents("trace.json"), true);
+    $sim = json_decode(file_get_contents("sim.json"), true);
+    $session = json_decode(file_get_contents("session.json"), true);
+    echo $trace["protocol"], "/", $trace["mode"], "/", $trace["result"]["state"], " ",
+        $sim["mode"], "/", $sim["result"]["state"], " ", $session["context"]["receipt"];')"
+if [[ "$trace_exit $sim1/$sim1_exit $sim2/$sim2_exit $summary" \
+    != "3 paused/3 done/0 divengine.runner.trace/run/paused simulation/done simulated receipt" ]]; then
+    echo "unexpected trace/simulate result: $trace_exit $sim1/$sim1_exit $sim2/$sim2_exit $summary" >&2
+    exit 1
+fi
+echo "trace/simulate: $summary"
 echo "smoke install OK ($mode)"

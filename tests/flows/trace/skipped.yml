@@ -1,0 +1,11 @@
+id: skipped
+blocks:
+  main:
+    steps:
+      gate:
+        condition: is_enabled
+        context:
+          gate_opened: true
+        activity: never_runs
+      after:
+        activity: produce

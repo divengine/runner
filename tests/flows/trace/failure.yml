@@ -1,0 +1,10 @@
+id: failure
+blocks:
+  main:
+    steps:
+      first:
+        activity: produce
+      broken:
+        activity: fail
+      never:
+        activity: never_runs

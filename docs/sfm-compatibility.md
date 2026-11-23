@@ -7,7 +7,7 @@ and job execution). The Python SFM modeler (canonical YAML, compiler, validator,
 simulator) is the secondary reference for YAML shape and step semantics
 (flow simulation notes, ADR-S03, ADR-I2-S01, ADR-I2-S02).
 
-Status of v0.2.0; the execution semantics are unchanged since v0.1.0. Test names
+Status of v0.3.0; the execution semantics are unchanged since v0.1.0. Test names
 refer to `tests/RunnerTest.php`.
 
 ## Terminology
@@ -48,6 +48,11 @@ Context keys follow the same vocabulary: `_current_block_id`, `_flow_state.block
 | YAML subset used by real flows | Block scalars, one-line flow collections, nested and indentless sequences, comments, quoted keys, YAML 1.1 scalar resolution as PyYAML `safe_load` (`yes`/`off` booleans, `0x1F`, `017`, `.5`). The 22 fixture flows of the Python modeler parse identically to PyYAML. | `testYamlParserSupportsBlockScalarsFlowCollectionsAndComments`, `testYamlParserMatchesPyYamlOnSequenceItemsAndScalars`, `testYamlParserRejectsMisindentedBlockScalarAndBadQuotes` |
 | Errors do not leave resumable state | Any error, including setup errors and errors before a saved position is reached, clears `_flow_state`, `_flow_stack` and pending resume markers; business data and diagnostics stay, and the next run starts at the first block. | `testErrorInsideCalledBlockLeavesNoStaleCallFrames`, `testErrorBeforeSavedPositionIsConsumedRestartsAtFirstBlock`, `testSetupErrorOnResumeClearsSavedPosition`, `testErrorAfterCallReturnRestartsAtFirstBlock`, `testRepeatedPauseJumpAndErrorAcrossCallsResumeFromJson` |
 | Storable context | After `run()` returns, the runner's helpers and block callables are removed; JSON serialization of user-supplied values is not guaranteed. | `testContextAfterRunHoldsOnlyData`, `testDeepCallContinuationsResumeFromJsonInFreshProcesses` |
+
+Tracing (`runner::runTraced()`) and simulation (`runner::simulate()`) use this
+same runtime, so the rows above hold for them. Steps, transfers and pauses are
+recorded as events, and simulation replaces functions with test doubles. See
+[tracing-and-simulation.md](tracing-and-simulation.md).
 
 ## Known divergences
 
@@ -90,5 +95,9 @@ ADR-I2-S01). Tests: `testDeepCallContinuationsResumeFromJsonInFreshProcesses`,
 - `_progress` reporting key.
 - YAML files used directly as activities (compile them to PHP first, as in
   `testNestedFlowActivityRestoresParentBlocks`).
-- Iteration limits for jump loops.
-- Modeler features: diagnostics with codes, simulation, legacy import, releases.
+- Iteration limits for jump loops in normal runs (issue #31). Simulations have
+  step, transfer and time budgets (see
+  [tracing-and-simulation.md](tracing-and-simulation.md)).
+- Modeler features: diagnostics with codes, legacy import, releases. Runner's
+  own simulation runs on its runtime with test doubles; it is not the
+  modeler's simulator.
