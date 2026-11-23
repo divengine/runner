@@ -17,6 +17,7 @@ namespace divengine\runner;
 
 use DateTimeImmutable;
 use DateTimeInterface;
+use InvalidArgumentException;
 use ReflectionFunction;
 use ReflectionFunctionAbstract;
 use ReflectionMethod;
@@ -41,6 +42,48 @@ final class runner
      * Default limit of nested calls, overridable with `_max_call_depth`.
      */
     public const MAX_CALL_DEPTH = 256;
+
+    /**
+     * Identifier and version of the trace document returned by `runTraced()`
+     * and `simulate()`. See docs/tracing-and-simulation.md.
+     */
+    public const TRACE_PROTOCOL = "divengine.runner.trace";
+    public const TRACE_VERSION = 1;
+
+    /**
+     * Trace caps and value capture defaults.
+     */
+    private const TRACE_DEFAULTS = [
+        "max_events" => 10000,
+        "max_bytes" => 4194304,
+        "max_string" => 1024,
+        "max_items" => 100,
+        "max_depth" => 8,
+        "max_nodes" => 2000,
+        "capture_values" => true,
+        "redact_keys" => [],
+        "exclude_keys" => [],
+    ];
+
+    /**
+     * Simulation budget defaults: entered steps, control transfers (calls and
+     * jumps) and wall-clock seconds of one simulated invocation.
+     */
+    private const BUDGET_DEFAULTS = ["steps" => 10000, "transfers" => 10000, "seconds" => 10.0];
+
+    /**
+     * Keys whose values a trace replaces with a redaction marker, at any depth.
+     */
+    private const REDACT_PATTERN = '/password|passwd|passphrase|secret|token|api[-_]?key|access[-_]?key|private[-_]?key'
+        . '|authorization|bearer|credential|cookie|session[-_]?id|signature|cvv|card[-_]?number/i';
+
+    /**
+     * Trace (and simulation) state of the innermost traced `run()`, or null.
+     * Kept outside the context so that no trace state can be saved with it.
+     *
+     * @var array<string, mixed>|null
+     */
+    private static ?array $trace = null;
 
     /**
      * Keys describing where the running flow is; restored after any activity.
@@ -122,19 +165,31 @@ final class runner
         array $context = [],
         ?callable $logger = null
     ): ?callable {
+        return self::importWithSource($name, $module, $context, $logger)[0];
+    }
+
+    /**
+     * `importer()` that also returns the file a callable was loaded from.
+     *
+     * @param array<string, mixed> $context
+     *
+     * @return array{0: ?callable, 1: ?string}
+     */
+    private static function importWithSource(string $name, ?string $module, array $context, ?callable $logger): array
+    {
         $logger = $logger ?? self::$loggerSink;
 
         $reference = trim($name);
         if ($reference === "") {
             self::emitLog($logger, "ERROR", "Import name is empty.");
-            return null;
+            return [null, null];
         }
 
         if ($module !== null) {
             $problem = self::moduleReferenceProblem($module, $reference);
             if ($problem !== null) {
                 self::emitLog($logger, "ERROR", "Invalid module reference: {$problem}");
-                return null;
+                return [null, null];
             }
             $folder = self::resolveModuleFolder($module, $context);
             $candidates = [self::ensurePhpExtension(self::joinPath($folder, $reference))];
@@ -153,25 +208,25 @@ final class runner
                 self::emitLog($logger, "ERROR", "Error requiring file: {$candidate}", [
                     "exception" => self::dumpException($e),
                 ]);
-                return null;
+                return [null, null];
             }
 
             if (!is_callable($func)) {
                 self::emitLog($logger, "ERROR", "Import file must return a callable: {$candidate}");
-                return null;
+                return [null, null];
             }
 
-            return $func;
+            return [$func, $candidate];
         }
 
         $callableReference = ltrim($reference, "\\");
         if ($module === null && is_callable($callableReference)) {
-            return $callableReference;
+            return [$callableReference, null];
         }
 
         $label = self::qualifiedName($reference, $module);
         self::emitLog($logger, "ERROR", "Import target not found or not callable: {$label}");
-        return null;
+        return [null, null];
     }
 
     /**
@@ -250,7 +305,7 @@ final class runner
                 $stepIdx = $stepPosition + 1;
                 $stepIdCode = var_export($step["id"], true);
                 $module = isset($step["module"]) && is_string($step["module"]) ? trim($step["module"]) : null;
-                $lines[] = "        if (\$checkPause({$stepIdx}, \$context)) {";
+                $lines[] = "        if (\$checkPause({$stepIdx}, \$context, {$stepIdCode})) {";
                 $indent = "            ";
 
                 $conditionRef = isset($step["condition"]) && is_string($step["condition"])
@@ -478,6 +533,164 @@ final class runner
      */
     public static function run(string|callable $flow, array &$context, array $options = []): void
     {
+        $trace = null;
+        self::execute($flow, $context, $options, $trace);
+    }
+
+    /**
+     * Runs a flow exactly like `run()` and returns a semantic trace of it.
+     *
+     * Tracing observes the run without changing it: the context ends as it
+     * would after `run()`, and no trace state is stored in it. The returned
+     * document follows the protocol `runner::TRACE_PROTOCOL`, version
+     * `runner::TRACE_VERSION` (see docs/tracing-and-simulation.md).
+     *
+     * Options: those of `run()`, plus `trace` (caps and value capture:
+     * `max_events`, `max_bytes`, `max_string`, `max_items`, `max_depth`,
+     * `max_nodes`, `capture_values`, `redact_keys`, `redact_defaults`,
+     * `exclude_keys`).
+     *
+     * Unlike `run()`, setup errors (unreadable or invalid flow) are not thrown:
+     * they are recorded in the context and in the trace result.
+     *
+     * @param array<string, mixed> $context
+     * @param array<string, mixed> $options
+     *
+     * @return array<string, mixed>
+     *
+     * @throws InvalidArgumentException On invalid trace options.
+     */
+    public static function runTraced(string|callable $flow, array &$context, array $options = []): array
+    {
+        $traceOptions = self::normalizeTraceOptions($options["trace"] ?? []);
+        unset($options["trace"]);
+
+        $trace = self::newTrace("run", $traceOptions, null);
+        if (is_string($flow) && is_file($flow)) {
+            $trace["sources"]["flow"] = self::fileSource("flow", $flow, $flow);
+        }
+        $fingerprint = self::fingerprint($trace["sources"]);
+
+        self::executeTraced($flow, $context, $options, $trace);
+
+        return self::traceDocument($trace, $flow, $fingerprint);
+    }
+
+    /**
+     * Simulates a YAML flow with test doubles instead of its functions.
+     *
+     * The flow runs through Runner's own compiler and runtime (blocks, steps,
+     * call, jump, pause, `_flow_state`, `_flow_stack`), but every condition and
+     * activity reference resolves to a declared double. No function file is
+     * imported and no callable name is resolved; a reference without a double
+     * fails the simulation. Returns the trace document (see `runTraced()`).
+     *
+     * `$doubles` maps qualified function names (`module:name` or `name`) to:
+     * - an outcome: `["returns" => value]`, `["throws" => "message"]` or
+     *   `["pause" => true]` (activities only), each optionally with
+     *   `"context" => [...]` merged into the context first;
+     * - `["sequence" => [outcome, ...]]`: one outcome per call, in order;
+     * - `["flow" => "child.yml"]`: a nested YAML flow used as the activity,
+     *   simulated with the same doubles.
+     *
+     * Options: `budget` (`steps`, `transfers`, `seconds`), `cancel` (callable
+     * returning true to stop), `double_calls` (calls made so far per double,
+     * from a previous trace, to resume), `fingerprint` (expected fingerprint:
+     * refuse to resume if the flow, doubles or nested flows changed), `trace`,
+     * `function_map`, `logger`, `shared_context`.
+     *
+     * @param array<string, mixed> $context
+     * @param array<string, mixed> $doubles
+     * @param array<string, mixed> $options
+     *
+     * @return array<string, mixed>
+     *
+     * @throws InvalidArgumentException On invalid doubles or options, a flow
+     *                                  that is not YAML, or a fingerprint mismatch.
+     */
+    public static function simulate(string $yamlPath, array &$context, array $doubles, array $options = []): array
+    {
+        if (!self::isYamlPath($yamlPath)) {
+            throw new InvalidArgumentException("[divengine.runner] Simulation runs YAML flows only: {$yamlPath}");
+        }
+        $allowed = ["budget", "cancel", "double_calls", "fingerprint", "trace", "function_map", "logger", "shared_context"];
+        $unknown = array_diff(array_keys($options), $allowed);
+        if ($unknown !== []) {
+            throw new InvalidArgumentException("[divengine.runner] Unknown simulation option: " . implode(", ", $unknown));
+        }
+        $cancel = $options["cancel"] ?? null;
+        if ($cancel !== null && !is_callable($cancel)) {
+            throw new InvalidArgumentException("[divengine.runner] Simulation option 'cancel' must be callable.");
+        }
+
+        $normalized = self::normalizeDoubles($doubles);
+        $simulation = [
+            "doubles" => $normalized,
+            "calls" => self::normalizeDoubleCalls($options["double_calls"] ?? []),
+            "compiled" => [],
+            "budget" => self::normalizeBudget($options["budget"] ?? []),
+            "counters" => ["steps" => 0, "transfers" => 0],
+            "started" => hrtime(true),
+            "cancel" => $cancel,
+            "function_map" => $options["function_map"] ?? [],
+        ];
+
+        $trace = self::newTrace("simulation", self::normalizeTraceOptions($options["trace"] ?? []), $simulation);
+        if (is_file($yamlPath)) {
+            $trace["sources"]["flow"] = self::fileSource("flow", $yamlPath, $yamlPath);
+        }
+        $trace["sources"]["doubles"] = [
+            "role" => "doubles",
+            "name" => "doubles",
+            "path" => null,
+            "sha256" => hash("sha256", self::canonicalJson(self::doublesForFingerprint($normalized))),
+        ];
+        foreach ($normalized as $name => $double) {
+            if ($double["kind"] === "flow") {
+                $trace["sources"]["nested_flow:" . $name] = self::fileSource("nested_flow", $name, $double["path"]);
+            }
+        }
+
+        $fingerprint = self::fingerprint($trace["sources"]);
+        if (isset($options["fingerprint"]) && $options["fingerprint"] !== $fingerprint) {
+            throw new InvalidArgumentException(
+                "[divengine.runner] The flow, its doubles or its nested flows changed: expected fingerprint "
+                . (is_string($options["fingerprint"]) ? $options["fingerprint"] : "?") . ", found {$fingerprint}."
+            );
+        }
+
+        $runOptions = array_intersect_key($options, array_flip(["function_map", "logger", "shared_context"]));
+        self::executeTraced($yamlPath, $context, $runOptions, $trace);
+
+        return self::traceDocument($trace, $yamlPath, $fingerprint);
+    }
+
+    /**
+     * Runs `run()` with `$trace` as the active trace (null: untraced). Nested
+     * `run()` calls made by activities are separate, untraced invocations.
+     *
+     * @param array<string, mixed>      $context
+     * @param array<string, mixed>      $options
+     * @param array<string, mixed>|null $trace
+     */
+    private static function execute(string|callable $flow, array &$context, array $options, ?array &$trace): void
+    {
+        $previous = self::$trace;
+        self::$trace = $trace;
+        try {
+            self::executeRun($flow, $context, $options);
+        } finally {
+            $trace = self::$trace;
+            self::$trace = $previous;
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     * @param array<string, mixed> $options
+     */
+    private static function executeRun(string|callable $flow, array &$context, array $options): void
+    {
         $loggerSink = $options["logger"] ?? self::$loggerSink;
         if ($loggerSink !== null && !is_callable($loggerSink)) {
             throw new RuntimeException("Logger must be a callable.");
@@ -504,12 +717,17 @@ final class runner
         $jumpToken = $tokens["jump"];
 
         // Expose helper callbacks inside context for flow/activity/condition files.
-        $context["_logger"] = $logger;
+        $context["_logger"] = self::$trace === null ? $logger : self::traceLogger($logger, $context);
         $context["_importer"] = function (string $name, ?string $module = null) use (
             $logger,
             &$context
         ): ?callable {
-            return self::importer($name, $module, $context, $logger);
+            if (self::$trace !== null && self::$trace["simulation"] !== null) {
+                return self::resolveDouble($name, $module, $context);
+            }
+            [$func, $file] = self::importWithSource($name, $module, $context, $logger);
+            self::traceFunction(self::qualifiedName(trim($name), $module), $func, $file);
+            return $func;
         };
 
         $context["_update_context"] = [self::class, "updateContext"];
@@ -537,17 +755,21 @@ final class runner
         if (($context["_flow_state"]["block"] ?? null) !== null) {
             $logger("INFO", "[divengine.runner] Resuming paused job execution");
         }
+        self::traceRunStart($context);
 
         // Setup failures (unreadable/invalid YAML, unresolved flow, bad signature)
         // are thrown to the caller, with the context left in the `error` state.
         try {
             $func = $flow;
+            if (self::$trace !== null && self::$trace["simulation"] !== null && !self::isYamlPath($flow)) {
+                throw new RuntimeException("[divengine.runner] Simulation runs YAML flows only.");
+            }
             if (is_string($flow)) {
-                $extension = strtolower(pathinfo($flow, PATHINFO_EXTENSION));
-                if ($extension === "yml" || $extension === "yaml") {
+                if (self::isYamlPath($flow)) {
                     $func = self::flowFromYaml($flow, $options);
                 } else {
-                    $func = self::importer($flow, null, $context, $logger);
+                    [$func, $file] = self::importWithSource($flow, null, $context, $logger);
+                    self::traceSource("flow", $flow, $file);
                 }
             }
 
@@ -564,6 +786,7 @@ final class runner
             $context["_runner_result"] = "Error: " . $e->getMessage();
             $logger("ERROR", "[divengine.runner] Flow setup failed - " . $e->getMessage());
             self::clearResumeState($context);
+            self::traceRunEnd($context, $e, true);
             self::finishRun($context, $records);
             throw $e;
         }
@@ -590,6 +813,7 @@ final class runner
 
                     if (!empty($context["_autoresume"])) {
                         $logger("INFO", "[divengine.runner] Auto-resuming enabled, will continue execution.");
+                        self::traceEvent("run.autoresume", ["checkpoint" => self::traceCheckpoint($context)], $context);
                         $resume = true;
                         $context["_runner_state"] = "processing";
                         $context["_runner_result"] .= " - will resume automatically.";
@@ -603,9 +827,11 @@ final class runner
                 $context["_runner_result"] = "Error: " . $e->getMessage();
                 self::clearResumeState($context);
                 $logger("ERROR", "[divengine.runner] Error processing job - " . $context["_runner_error"]);
+                $runError = $e;
             }
         }
 
+        self::traceRunEnd($context, $runError ?? null, false);
         self::finishRun($context, $records);
     }
 
@@ -685,16 +911,26 @@ final class runner
             );
         }
         $context["_flow_depth"] = $depth + 1;
+        if ($depth > 0) {
+            self::traceEvent("flow.enter", ["initial_block" => $initialBlock], $context);
+        }
+        $outcome = "error";
 
         try {
-            return self::runBlocks($initialBlock, $context, $tokens);
+            $result = self::runBlocks($initialBlock, $context, $tokens);
+            $outcome = "done";
+            return $result;
         } catch (Throwable $e) {
             if ($depth > 0 && self::isPauseException($e, $tokens)) {
                 // Tells the enclosing activity that this nested flow paused.
                 $context["_nested_flow_paused"] = true;
+                $outcome = "paused";
             }
             throw $e;
         } finally {
+            if ($depth > 0) {
+                self::traceEvent("flow.exit", ["outcome" => $outcome], $context);
+            }
             $context["_flow_depth"] = $depth;
         }
     }
@@ -704,12 +940,14 @@ final class runner
      */
     private static function runBlocks(string $initialBlock, array &$context, array $tokens): mixed
     {
+        $reason = null;
         while (true) {
             $state = $context["_flow_state"] ?? [];
             $savedBlock = is_array($state) ? ($state["block"] ?? null) : null;
 
             if (is_string($savedBlock) && $savedBlock !== "") {
                 $initialBlock = $savedBlock;
+                $reason ??= "resume";
             }
 
             $key = "_" . $initialBlock;
@@ -718,6 +956,7 @@ final class runner
             }
 
             $context["_current_block_id"] = $initialBlock;
+            self::traceBlockEnter($initialBlock, $reason ?? "start", $context);
 
             try {
                 $result = ($context[$key])($context);
@@ -725,6 +964,7 @@ final class runner
                 if (!self::isJumpException($e, $tokens)) {
                     throw $e;
                 }
+                $reason = "jump";
 
                 $target = $context["_flow_state"]["block"] ?? null;
                 if ($target !== $initialBlock) {
@@ -738,11 +978,15 @@ final class runner
                             break;
                         }
                     }
+                    if (count($kept) < count($stack)) {
+                        self::traceEvent("call.drop", ["frames" => array_slice($stack, count($kept))], $context);
+                    }
                     $context["_flow_stack"] = $kept;
                 }
                 continue;
             }
 
+            self::traceEvent("block.exit", ["block" => $initialBlock], $context);
             $stack = self::flowStack($context);
             if ($stack === []) {
                 $context["_flow_stack"] = [];
@@ -757,6 +1001,12 @@ final class runner
                 "step_index" => $frame["step_index"] - 1,
                 "after_call" => $frame["step_index"],
             ];
+            $reason = "return";
+            self::traceEvent("call.return", [
+                "from" => $initialBlock,
+                "to" => ["block" => $frame["block"], "index" => $frame["step_index"]],
+                "resumed" => true,
+            ], $context);
 
             self::logContext(
                 $context,
@@ -802,8 +1052,14 @@ final class runner
      */
     public static function updateContext(array &$context, array $data, string $stepId, int $stepIdx): void
     {
+        $before = self::$trace !== null ? $context : [];
         $context = array_replace($context, $data);
         self::traceStep("context.update", "updateContext", $stepId, $stepIdx, $context);
+        if (self::$trace !== null) {
+            self::traceEvent("context.update", self::traceStepRef($context, $stepId, $stepIdx) + [
+                "changes" => self::traceChanges($before, $context),
+            ], $context);
+        }
     }
 
     /**
@@ -816,7 +1072,34 @@ final class runner
      *
      * @internal Called by generated flow code through `_check_pause`.
      */
-    public static function checkPause(int $stepIdx, array &$context): bool
+    public static function checkPause(int $stepIdx, array &$context, ?string $stepId = null): bool
+    {
+        if (self::$trace === null) {
+            return self::checkPausePosition($stepIdx, $context);
+        }
+
+        $continuation = (($context["_flow_state"]["after_call"] ?? null) === $stepIdx);
+        $enter = self::checkPausePosition($stepIdx, $context);
+        $ref = ["block" => self::currentBlock($context), "step" => $stepId, "index" => $stepIdx];
+        if (!$enter) {
+            // Steps before the position a block was entered at: the target of a
+            // call or jump, or the checkpoint of a resume (already executed).
+            $entry = self::$trace["entry"] ?? null;
+            self::traceEvent("step.skip", $ref + [
+                "reason" => $entry === "call" || $entry === "jump" ? "before_target" : "before_checkpoint",
+            ], $context);
+            return false;
+        }
+
+        self::traceEvent("step.start", $ref + ["continuation" => $continuation], $context);
+        self::simulationTick("steps", $context);
+        return true;
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private static function checkPausePosition(int $stepIdx, array &$context): bool
     {
         if (!isset($context["_flow_state"])) {
             $context["_flow_state"] = [];
@@ -871,7 +1154,31 @@ final class runner
     public static function wrapCondition(callable $func, string $stepId, int $stepIdx, array &$context): mixed
     {
         self::traceStep("condition", self::callableName($func), $stepId, $stepIdx, $context);
-        return $func($context);
+        if (self::$trace === null) {
+            return $func($context);
+        }
+
+        $ref = self::traceStepRef($context, $stepId, $stepIdx);
+        $function = self::traceFunctionName($func);
+        self::simulationGuardCondition($function);
+        self::$trace["phase"] = "condition";
+        self::$trace["function_call_depth"] = count(self::flowStack($context));
+        try {
+            $value = $func($context);
+        } catch (Throwable $e) {
+            self::traceEvent("condition.error", $ref + ["function" => $function, "error" => self::traceError($e)], $context);
+            throw $e;
+        }
+
+        $event = $ref + ["function" => $function, "result" => (bool) $value];
+        if (!is_bool($value)) {
+            $event["value"] = self::traceValue($value, null);
+        }
+        self::traceEvent("condition", $event, $context);
+        if (!$value) {
+            self::traceEvent("step.skip", $ref + ["reason" => "condition_false"], $context);
+        }
+        return $value;
     }
 
     /**
@@ -888,6 +1195,16 @@ final class runner
     {
         self::traceStep("activity", self::callableName($func), $stepId, $stepIdx, $context);
         $tokens = self::ensureTokens($context);
+        $traced = self::$trace !== null;
+        $ref = $traced ? self::traceStepRef($context, $stepId, $stepIdx) : [];
+        $function = $traced ? self::traceFunctionName($func) : "";
+        if ($traced) {
+            self::traceEvent("activity.start", $ref + ["function" => $function], $context);
+            self::$trace["phase"] = "activity";
+            // Events raised by the function itself (doubles, logs) belong to this
+            // step, although the activity runs with an empty call stack.
+            self::$trace["function_call_depth"] = count(self::flowStack($context));
+        }
 
         // A flow used as an activity has its own control state: it starts with
         // an empty call stack, and the parent's scope comes back afterwards.
@@ -900,6 +1217,9 @@ final class runner
         } catch (Throwable $e) {
             if (!self::isPauseException($e, $tokens)) {
                 $context["_flow_stack"] = $snapshot["_flow_stack"] ?? [];
+                if ($traced) {
+                    self::traceEvent("activity.error", $ref + ["function" => $function, "error" => self::traceError($e)], $context);
+                }
                 throw $e;
             }
 
@@ -909,12 +1229,26 @@ final class runner
                 unset($context["_nested_flow_paused"]);
                 self::restoreControl($context, $snapshot, false);
                 $context[$stepId] = null;
+                if ($traced) {
+                    self::traceEvent("activity.end", $ref + [
+                        "function" => $function,
+                        "result" => null,
+                        "nested_flow_paused" => true,
+                        "changes" => self::traceChanges($snapshot, $context),
+                    ], $context);
+                }
                 return;
             }
 
             // The activity asked to pause the flow: pause at this step, without
             // storing a result.
             self::restoreControl($context, $snapshot, true);
+            if ($traced) {
+                self::traceEvent("activity.pause", $ref + [
+                    "function" => $function,
+                    "changes" => self::traceChanges($snapshot, $context),
+                ], $context);
+            }
             $block = $context["_current_block_id"] ?? null;
             self::wrapPause(is_string($block) ? $block : "", $stepId, $stepIdx, $context);
         }
@@ -923,6 +1257,13 @@ final class runner
         // `_flow_state` and `_autoresume` stay as the activity left them.
         self::restoreControl($context, $snapshot, true);
         $context[$stepId] = $result;
+        if ($traced) {
+            self::traceEvent("activity.end", $ref + [
+                "function" => $function,
+                "result" => self::traceValue($result, $stepId),
+                "changes" => self::traceChanges($snapshot, $context),
+            ], $context);
+        }
     }
 
     /**
@@ -959,6 +1300,11 @@ final class runner
                 "[divengine.runner] Call depth exceeds {$maxDepth} at {$fromBlock}.{$stepId} -> {$targetBlock} (recursive call?)."
             );
         }
+        self::traceEvent("call", self::traceStepRef($context, $stepId, $stepIdx) + [
+            "target" => ["block" => $targetBlock, "index" => $targetIndex + 1],
+            "returns" => true,
+        ], $context);
+        self::simulationTick("transfers", $context);
         $stack[] = ["block" => $fromBlock, "step_index" => $stepIdx];
         $context["_flow_stack"] = $stack;
         $depth = count($stack);
@@ -966,25 +1312,36 @@ final class runner
 
         $context["_flow_state"] = ["block" => $targetBlock, "step_index" => $targetIndex];
 
+        $reason = "call";
         while (true) {
             $context["_current_block_id"] = $targetBlock;
+            self::traceBlockEnter($targetBlock, $reason, $context);
             try {
                 $func($context);
                 break;
             } catch (Throwable $e) {
                 if (self::isJumpException($e, $tokens)) {
                     if (($context["_flow_state"]["block"] ?? null) === $targetBlock) {
+                        $reason = "jump";
                         continue;
                     }
-                    $context["_flow_stack"] = array_slice(self::flowStack($context), 0, $depth - 1);
+                    $stack = self::flowStack($context);
+                    self::traceEvent("call.drop", ["frames" => array_slice($stack, $depth - 1)], $context);
+                    $context["_flow_stack"] = array_slice($stack, 0, $depth - 1);
                 }
                 // Pause and errors keep the frame: it is the persisted continuation.
                 throw $e;
             }
         }
 
+        self::traceEvent("block.exit", ["block" => $targetBlock], $context);
         $context["_flow_stack"] = array_slice(self::flowStack($context), 0, $depth - 1);
         $context["_current_block_id"] = $fromBlock;
+        self::traceEvent("call.return", [
+            "from" => $targetBlock,
+            "to" => ["block" => $fromBlock, "step" => $stepId, "index" => $stepIdx],
+            "resumed" => false,
+        ], $context);
 
         // A pointer into the called block that no step consumed (empty block).
         if (($context["_flow_state"]["block"] ?? null) === $targetBlock) {
@@ -1010,6 +1367,11 @@ final class runner
     ): never {
         self::traceStep("jump", $targetBlock, $stepId, $stepIdx, $context, "{$targetBlock}[{$targetIndex}]");
 
+        self::traceEvent("jump", self::traceStepRef($context, $stepId, $stepIdx) + [
+            "target" => ["block" => $targetBlock, "index" => $targetIndex + 1],
+            "returns" => false,
+        ], $context);
+        self::simulationTick("transfers", $context);
         $context["_flow_state"] = ["block" => $targetBlock, "step_index" => $targetIndex];
         $tokens = self::ensureTokens($context);
         throw new RuntimeException("{$tokens["jump"]} Jump to {$targetBlock}[{$targetIndex}]");
@@ -1031,6 +1393,8 @@ final class runner
         self::traceStep("pause", $block, $stepId, $stepIdx, $context);
 
         $context["_flow_state"] = ["block" => $block, "step_index" => $stepIdx];
+        self::traceEvent("pause", ["block" => $block, "step" => $stepId, "index" => $stepIdx,
+            "checkpoint" => self::traceCheckpoint($context)], $context);
 
         self::logContext(
             $context,
@@ -2677,5 +3041,878 @@ final class runner
         }
 
         return null;
+    }
+
+    // ---------------------------------------------------------------------
+    // Tracing and simulation. Everything below is inert unless a trace is
+    // active (`self::$trace`), which only `runTraced()` and `simulate()` do.
+    // ---------------------------------------------------------------------
+
+    private const TRACE_JSON = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION
+        | JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR;
+
+    private static function isYamlPath(mixed $flow): bool
+    {
+        return is_string($flow) && in_array(strtolower(pathinfo($flow, PATHINFO_EXTENSION)), ["yml", "yaml"], true);
+    }
+
+    /**
+     * Runs with an active trace. Setup errors are recorded, not thrown; any
+     * failure before the run started (an invalid logger) is rethrown.
+     *
+     * @param array<string, mixed> $context
+     * @param array<string, mixed> $options
+     * @param array<string, mixed> $trace
+     */
+    private static function executeTraced(string|callable $flow, array &$context, array $options, array &$trace): void
+    {
+        try {
+            self::execute($flow, $context, $options, $trace);
+        } catch (Throwable $e) {
+            if ($trace["result"] === null) {
+                throw $e;
+            }
+        }
+    }
+
+    /**
+     * @param array<string, mixed>      $options
+     * @param array<string, mixed>|null $simulation
+     *
+     * @return array<string, mixed>
+     */
+    private static function newTrace(string $mode, array $options, ?array $simulation): array
+    {
+        return [
+            "mode" => $mode,
+            "options" => $options,
+            "simulation" => $simulation,
+            "events" => [],
+            "seq" => 0,
+            "bytes" => 0,
+            "truncated" => null,
+            "dropped" => 0,
+            "sources" => [],
+            "last_function" => null,
+            "phase" => null,
+            "function_call_depth" => null,
+            "entry" => null,
+            "result" => null,
+            "started_at" => (new DateTimeImmutable())->format(DateTimeInterface::ATOM),
+            "started" => hrtime(true),
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $trace
+     *
+     * @return array<string, mixed>
+     */
+    private static function traceDocument(array $trace, string|callable $flow, string $fingerprint): array
+    {
+        $flowId = null;
+        if (self::isYamlPath($flow) && is_string($flow) && is_file($flow)) {
+            try {
+                $definition = self::parseYamlFlowFile($flow);
+                $flowId = is_string($definition["id"] ?? null) ? $definition["id"] : null;
+            } catch (Throwable $e) {
+                $flowId = null;
+            }
+        }
+
+        $options = $trace["options"];
+        $simulation = $trace["simulation"];
+
+        return [
+            "protocol" => self::TRACE_PROTOCOL,
+            "version" => self::TRACE_VERSION,
+            "mode" => $trace["mode"],
+            "flow" => [
+                "path" => is_string($flow) ? $flow : null,
+                "id" => $flowId,
+                "callable" => is_string($flow) ? null : self::callableName($flow),
+            ],
+            "fingerprint" => $fingerprint,
+            "sources" => array_values($trace["sources"]),
+            "limits" => array_diff_key($options, array_flip(["redact_keys", "exclude_keys"])),
+            "budget" => $simulation !== null ? $simulation["budget"] : null,
+            "result" => $trace["result"],
+            "simulation" => $simulation !== null ? ["double_calls" => $simulation["calls"]] : null,
+            "truncated" => $trace["truncated"] !== null,
+            "truncation" => $trace["truncated"] !== null
+                ? ["reason" => $trace["truncated"], "dropped_events" => $trace["dropped"]]
+                : null,
+            "events" => $trace["events"],
+            "meta" => [
+                "started_at" => $trace["started_at"],
+                "duration_ms" => round((hrtime(true) - $trace["started"]) / 1e6, 3),
+                "php_version" => PHP_VERSION,
+            ],
+        ];
+    }
+
+    /**
+     * Appends an event unless the trace is full. Forced events (run end,
+     * budget exhaustion, truncation notice) are always kept.
+     *
+     * @param array<string, mixed> $data
+     * @param array<string, mixed> $context
+     */
+    private static function traceEvent(string $type, array $data, array $context, bool $force = false): void
+    {
+        if (self::$trace === null) {
+            return;
+        }
+        if (self::$trace["truncated"] !== null && !$force) {
+            self::$trace["dropped"]++;
+            return;
+        }
+
+        $flowDepth = is_int($context["_flow_depth"] ?? null) ? $context["_flow_depth"] : 1;
+        $callDepth = $data["call_depth"] ?? count(self::flowStack($context));
+        unset($data["call_depth"]);
+        $event = [
+            "seq" => self::$trace["seq"] + 1,
+            "type" => $type,
+            "flow_depth" => max(0, $flowDepth - 1),
+            "call_depth" => $callDepth,
+        ] + $data;
+        $size = strlen((string) json_encode($event, self::TRACE_JSON)) + 1;
+
+        if (!$force) {
+            $options = self::$trace["options"];
+            $reason = null;
+            if (count(self::$trace["events"]) >= $options["max_events"]) {
+                $reason = "max_events";
+            } elseif (self::$trace["bytes"] + $size > $options["max_bytes"]) {
+                $reason = "max_bytes";
+            }
+            if ($reason !== null) {
+                self::$trace["truncated"] = $reason;
+                self::$trace["dropped"]++;
+                return;
+            }
+        }
+
+        self::$trace["seq"]++;
+        self::$trace["events"][] = $event;
+        self::$trace["bytes"] += $size;
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private static function traceBlockEnter(string $block, string $reason, array $context): void
+    {
+        if (self::$trace === null) {
+            return;
+        }
+        self::$trace["entry"] = $reason;
+        self::traceEvent("block.enter", ["block" => $block, "reason" => $reason], $context);
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private static function traceRunStart(array $context): void
+    {
+        if (self::$trace === null) {
+            return;
+        }
+        $state = $context["_flow_state"] ?? [];
+        self::traceEvent("run.start", [
+            "mode" => self::$trace["mode"],
+            "resume" => is_array($state) && is_string($state["block"] ?? null) && $state["block"] !== "",
+            "checkpoint" => self::traceCheckpoint($context),
+            "context" => self::traceSnapshot($context),
+        ], $context);
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private static function traceRunEnd(array $context, ?Throwable $error, bool $setup): void
+    {
+        if (self::$trace === null) {
+            return;
+        }
+        $state = is_string($context["_runner_state"] ?? null) ? $context["_runner_state"] : "error";
+        $result = [
+            "state" => $state,
+            "error" => $error !== null ? self::traceError($error) : null,
+            "setup_error" => $setup,
+        ];
+        self::$trace["result"] = $result;
+
+        self::traceEvent("run.end", $result + [
+            "checkpoint" => self::traceCheckpoint($context),
+            "context" => self::traceSnapshot($context),
+        ], $context, true);
+
+        if (self::$trace["truncated"] !== null) {
+            self::traceEvent("trace.truncated", [
+                "reason" => self::$trace["truncated"],
+                "dropped_events" => self::$trace["dropped"],
+            ], $context, true);
+        }
+    }
+
+    /**
+     * Position and call return frames as Runner stores them for a resume.
+     *
+     * @param array<string, mixed> $context
+     *
+     * @return array<string, mixed>
+     */
+    private static function traceCheckpoint(array $context): array
+    {
+        $state = $context["_flow_state"] ?? [];
+        $checkpoint = [];
+        if (is_array($state)) {
+            foreach (["block", "step_index", "after_call"] as $key) {
+                if (array_key_exists($key, $state) && (is_string($state[$key]) || is_int($state[$key]) || $state[$key] === null)) {
+                    $checkpoint[$key] = $state[$key];
+                }
+            }
+        }
+
+        return ["flow_state" => $checkpoint, "flow_stack" => self::flowStack($context)];
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private static function currentBlock(array $context): ?string
+    {
+        $block = $context["_current_block_id"] ?? null;
+        return is_string($block) ? $block : null;
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     *
+     * @return array{block: ?string, step: string, index: int}
+     */
+    private static function traceStepRef(array $context, string $stepId, int $stepIdx): array
+    {
+        return ["block" => self::currentBlock($context), "step" => $stepId, "index" => $stepIdx];
+    }
+
+    /**
+     * @return array{class: string, message: string}
+     */
+    private static function traceError(Throwable $e): array
+    {
+        $message = $e->getMessage();
+        $max = self::$trace["options"]["max_string"] ?? 1024;
+        if (strlen($message) > $max) {
+            $message = self::utf8Prefix($message, $max) . "...";
+        }
+        return ["class" => get_class($e), "message" => $message];
+    }
+
+    /**
+     * Logger that also records the flow's own log messages (not Runner's).
+     *
+     * @param array<string, mixed> $context
+     */
+    private static function traceLogger(callable $logger, array &$context): callable
+    {
+        return function (string $level, string $message, array $logContext = []) use ($logger, &$context): void {
+            $logger($level, $message, $logContext);
+            if (self::$trace !== null && !str_starts_with($message, "[divengine.runner]")) {
+                $max = self::$trace["options"]["max_string"];
+                self::traceEvent("log", [
+                    "call_depth" => self::$trace["function_call_depth"] ?? count(self::flowStack($context)),
+                    "block" => self::currentBlock($context),
+                    "step" => is_string($context["_current_step_id"] ?? null) ? $context["_current_step_id"] : null,
+                    "level" => $level,
+                    "message" => strlen($message) > $max ? self::utf8Prefix($message, $max) . "..." : $message,
+                ], $context);
+            }
+        };
+    }
+
+    private static function traceFunction(string $name, mixed $func, ?string $file): void
+    {
+        if (self::$trace === null) {
+            return;
+        }
+        self::$trace["last_function"] = ["name" => $name, "callable" => $func, "kind" => "function"];
+        self::traceSource("function", $name, $file);
+    }
+
+    private static function traceSource(string $role, string $name, ?string $file): void
+    {
+        if (self::$trace === null || $file === null) {
+            return;
+        }
+        $source = self::fileSource($role, $name, $file);
+        self::$trace["sources"][$role . ":" . $source["path"]] ??= $source;
+    }
+
+    /**
+     * @return array{role: string, name: string, path: string, sha256: ?string}
+     */
+    private static function fileSource(string $role, string $name, string $file): array
+    {
+        $path = realpath($file);
+        $path = $path === false ? $file : $path;
+        $hash = is_file($path) ? hash_file("sha256", $path) : false;
+
+        return ["role" => $role, "name" => $name, "path" => $path, "sha256" => $hash === false ? null : $hash];
+    }
+
+    /**
+     * Fingerprint of the sources known before a run: the flow, and in a
+     * simulation its doubles and nested flows. Paths do not take part.
+     *
+     * @param array<string, array<string, mixed>> $sources
+     */
+    private static function fingerprint(array $sources): string
+    {
+        $parts = [];
+        foreach ($sources as $source) {
+            $parts[] = [$source["role"], $source["role"] === "flow" ? "" : $source["name"], $source["sha256"]];
+        }
+        sort($parts);
+
+        return "sha256:" . hash("sha256", (string) json_encode([self::TRACE_VERSION, $parts]));
+    }
+
+    private static function canonicalJson(mixed $value): string
+    {
+        $canonical = static function (mixed $value) use (&$canonical): mixed {
+            if (!is_array($value)) {
+                return $value;
+            }
+            if (!array_is_list($value)) {
+                ksort($value, SORT_STRING);
+            }
+            return array_map($canonical, $value);
+        };
+
+        return (string) json_encode($canonical($value), self::TRACE_JSON);
+    }
+
+    private static function traceFunctionName(callable $func): string
+    {
+        $last = self::$trace["last_function"] ?? null;
+        if (is_array($last) && $last["callable"] === $func) {
+            return $last["name"];
+        }
+        return self::callableName($func);
+    }
+
+    /**
+     * Business keys of the context (not `_`-prefixed), as trace values.
+     *
+     * @param array<string, mixed> $context
+     *
+     * @return array<int|string, mixed>
+     */
+    private static function traceSnapshot(array $context): array
+    {
+        $nodes = self::$trace["options"]["max_nodes"] ?? 0;
+        $snapshot = [];
+        foreach ($context as $key => $value) {
+            if ((is_string($key) && str_starts_with($key, "_")) || self::isExcludedKey($key)) {
+                continue;
+            }
+            $snapshot[$key] = self::traceValue($value, $key, $nodes);
+        }
+
+        return $snapshot;
+    }
+
+    /**
+     * Changes of business keys between two contexts, in key order of `$after`.
+     *
+     * @param array<string, mixed> $before
+     * @param array<string, mixed> $after
+     *
+     * @return list<array<string, mixed>>
+     */
+    private static function traceChanges(array $before, array $after): array
+    {
+        $nodes = self::$trace["options"]["max_nodes"] ?? 0;
+        $changes = [];
+        foreach ($after as $key => $value) {
+            if ((is_string($key) && str_starts_with($key, "_")) || self::isExcludedKey($key)) {
+                continue;
+            }
+            if (!array_key_exists($key, $before)) {
+                $changes[] = ["key" => $key, "op" => "added", "after" => self::traceValue($value, $key, $nodes)];
+            } elseif ($before[$key] !== $value) {
+                $changes[] = [
+                    "key" => $key,
+                    "op" => "changed",
+                    "before" => self::traceValue($before[$key], $key, $nodes),
+                    "after" => self::traceValue($value, $key, $nodes),
+                ];
+            }
+        }
+        foreach ($before as $key => $value) {
+            if ((is_string($key) && str_starts_with($key, "_")) || self::isExcludedKey($key)) {
+                continue;
+            }
+            if (!array_key_exists($key, $after)) {
+                $changes[] = ["key" => $key, "op" => "removed"];
+            }
+        }
+
+        return $changes;
+    }
+
+    /**
+     * A JSON-safe, bounded and redacted copy of a value. Values JSON cannot
+     * hold, and values cut by the caps, become markers `{"$type": ...}`.
+     */
+    private static function traceValue(mixed $value, int|string|null $key, ?int &$nodes = null): mixed
+    {
+        $options = self::$trace["options"] ?? self::TRACE_DEFAULTS;
+        if ($nodes === null) {
+            $nodes = $options["max_nodes"];
+        }
+        return self::traceNode($value, $key, 0, $nodes, $options);
+    }
+
+    /**
+     * @param array<string, mixed> $options
+     */
+    private static function traceNode(mixed $value, int|string|null $key, int $depth, int &$nodes, array $options): mixed
+    {
+        if ($key !== null && self::isRedactedKey($key, $options)) {
+            return ['$type' => "redacted"];
+        }
+        if (--$nodes < 0) {
+            return ['$type' => "truncated"];
+        }
+        if (!$options["capture_values"]) {
+            return ['$type' => get_debug_type($value)];
+        }
+
+        if ($value === null || is_bool($value) || is_int($value)) {
+            return $value;
+        }
+        if (is_float($value)) {
+            if (is_finite($value)) {
+                return $value;
+            }
+            return ['$type' => "float", "value" => is_nan($value) ? "NAN" : ($value > 0 ? "INF" : "-INF")];
+        }
+        if (is_string($value)) {
+            if (preg_match('//u', $value) !== 1) {
+                return ['$type' => "binary", "length" => strlen($value)];
+            }
+            if (strlen($value) > $options["max_string"]) {
+                return [
+                    '$type' => "string",
+                    "truncated" => true,
+                    "length" => strlen($value),
+                    "value" => self::utf8Prefix($value, $options["max_string"]),
+                ];
+            }
+            return $value;
+        }
+        if (is_array($value)) {
+            if ($depth >= $options["max_depth"]) {
+                return ['$type' => "array", "truncated" => true, "count" => count($value)];
+            }
+            $isList = array_is_list($value);
+            $out = [];
+            $kept = 0;
+            $skipped = 0;
+            foreach ($value as $itemKey => $item) {
+                if (self::isExcludedKey($itemKey, $options)) {
+                    $skipped++;
+                    continue;
+                }
+                if ($kept >= $options["max_items"]) {
+                    break;
+                }
+                $out[$itemKey] = self::traceNode($item, $itemKey, $depth + 1, $nodes, $options);
+                $kept++;
+            }
+            $more = count($value) - $kept - $skipped;
+            if ($more > 0) {
+                if ($isList) {
+                    $out[] = ['$type' => "more", "count" => $more];
+                } else {
+                    $out['$more'] = $more;
+                }
+            }
+            return $out;
+        }
+        if ($value instanceof \Closure) {
+            return ['$type' => "closure"];
+        }
+        if (is_object($value)) {
+            return ['$type' => "object", "class" => get_class($value)];
+        }
+
+        return ['$type' => "resource", "kind" => is_resource($value) ? get_resource_type($value) : "closed"];
+    }
+
+    /**
+     * @param array<string, mixed>|null $options
+     */
+    private static function isRedactedKey(int|string $key, ?array $options = null): bool
+    {
+        $options = $options ?? self::$trace["options"] ?? self::TRACE_DEFAULTS;
+        $key = (string) $key;
+        if (in_array(strtolower($key), $options["redact_keys"], true)) {
+            return true;
+        }
+        return ($options["redact_defaults"] ?? true) && preg_match(self::REDACT_PATTERN, $key) === 1;
+    }
+
+    /**
+     * @param array<string, mixed>|null $options
+     */
+    private static function isExcludedKey(int|string $key, ?array $options = null): bool
+    {
+        $options = $options ?? self::$trace["options"] ?? self::TRACE_DEFAULTS;
+        return in_array((string) $key, $options["exclude_keys"], true);
+    }
+
+    private static function utf8Prefix(string $value, int $bytes): string
+    {
+        $prefix = substr($value, 0, $bytes);
+        for ($i = 0; $i < 4 && $prefix !== "" && preg_match('//u', $prefix) !== 1; $i++) {
+            $prefix = substr($prefix, 0, -1);
+        }
+        return $prefix;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private static function normalizeTraceOptions(mixed $options): array
+    {
+        if (!is_array($options)) {
+            throw new InvalidArgumentException("[divengine.runner] Trace options must be an array.");
+        }
+        $defaults = self::TRACE_DEFAULTS + ["redact_defaults" => true];
+        $unknown = array_diff(array_keys($options), array_keys($defaults));
+        if ($unknown !== []) {
+            throw new InvalidArgumentException("[divengine.runner] Unknown trace option: " . implode(", ", $unknown));
+        }
+        $options += $defaults;
+
+        foreach (["max_events", "max_bytes", "max_string", "max_items", "max_depth", "max_nodes"] as $key) {
+            if (!is_int($options[$key]) || $options[$key] < 1) {
+                throw new InvalidArgumentException("[divengine.runner] Trace option '{$key}' must be a positive integer.");
+            }
+        }
+        foreach (["capture_values", "redact_defaults"] as $key) {
+            if (!is_bool($options[$key])) {
+                throw new InvalidArgumentException("[divengine.runner] Trace option '{$key}' must be a boolean.");
+            }
+        }
+        foreach (["redact_keys", "exclude_keys"] as $key) {
+            if (!is_array($options[$key]) || !array_is_list($options[$key])
+                || array_filter($options[$key], fn (mixed $k): bool => !is_string($k) || $k === "") !== []) {
+                throw new InvalidArgumentException("[divengine.runner] Trace option '{$key}' must be a list of key names.");
+            }
+        }
+        $options["redact_keys"] = array_map("strtolower", $options["redact_keys"]);
+
+        return $options;
+    }
+
+    /**
+     * @return array{steps: int, transfers: int, seconds: float}
+     */
+    private static function normalizeBudget(mixed $budget): array
+    {
+        if (!is_array($budget)) {
+            throw new InvalidArgumentException("[divengine.runner] Simulation budget must be an array.");
+        }
+        $unknown = array_diff(array_keys($budget), array_keys(self::BUDGET_DEFAULTS));
+        if ($unknown !== []) {
+            throw new InvalidArgumentException("[divengine.runner] Unknown simulation budget: " . implode(", ", $unknown));
+        }
+        $budget += self::BUDGET_DEFAULTS;
+        foreach (["steps", "transfers"] as $key) {
+            if (!is_int($budget[$key]) || $budget[$key] < 1) {
+                throw new InvalidArgumentException("[divengine.runner] Simulation budget '{$key}' must be a positive integer.");
+            }
+        }
+        if (!(is_int($budget["seconds"]) || is_float($budget["seconds"])) || $budget["seconds"] <= 0) {
+            throw new InvalidArgumentException("[divengine.runner] Simulation budget 'seconds' must be a positive number.");
+        }
+
+        return ["steps" => $budget["steps"], "transfers" => $budget["transfers"], "seconds" => (float) $budget["seconds"]];
+    }
+
+    /**
+     * @return array<string, int>
+     */
+    private static function normalizeDoubleCalls(mixed $calls): array
+    {
+        if (!is_array($calls)) {
+            throw new InvalidArgumentException("[divengine.runner] Option 'double_calls' must be an array.");
+        }
+        foreach ($calls as $name => $count) {
+            if (!is_string($name) || !is_int($count) || $count < 0) {
+                throw new InvalidArgumentException("[divengine.runner] Option 'double_calls' maps double names to call counts.");
+            }
+        }
+
+        return $calls;
+    }
+
+    /**
+     * @param array<mixed> $doubles
+     *
+     * @return array<string, array<string, mixed>>
+     */
+    private static function normalizeDoubles(array $doubles): array
+    {
+        $normalized = [];
+        foreach ($doubles as $name => $spec) {
+            $label = is_string($name) ? $name : (string) $name;
+            if (!is_string($name) || trim($name) === "" || trim($name) !== $name) {
+                throw new InvalidArgumentException("[divengine.runner] Invalid double name: '{$label}'.");
+            }
+            // `module:name` qualifies a function; `Class::method` is a plain callable name.
+            if (str_contains($name, ":") && !str_contains($name, "::")) {
+                [$module, $function] = explode(":", $name, 2);
+                $problem = self::moduleReferenceProblem($module, $function);
+                if ($problem !== null) {
+                    throw new InvalidArgumentException("[divengine.runner] Invalid module in double name '{$name}': {$problem}.");
+                }
+            }
+            if (!is_array($spec) || ($spec !== [] && array_is_list($spec))) {
+                throw new InvalidArgumentException("[divengine.runner] Double '{$name}' must be a mapping.");
+            }
+
+            $kinds = array_values(array_intersect(["returns", "throws", "pause", "sequence", "flow"], array_keys($spec)));
+            if (count($kinds) !== 1) {
+                throw new InvalidArgumentException(
+                    "[divengine.runner] Double '{$name}' needs exactly one of returns, throws, pause, sequence, flow."
+                );
+            }
+
+            if ($kinds[0] === "flow") {
+                $unknown = array_diff(array_keys($spec), ["flow", "description"]);
+                $path = $spec["flow"];
+                if ($unknown !== [] || !is_string($path) || !self::isYamlPath($path)) {
+                    throw new InvalidArgumentException("[divengine.runner] Double '{$name}': 'flow' takes only a .yml or .yaml path.");
+                }
+                $real = realpath($path);
+                if ($real === false || !is_file($real)) {
+                    throw new InvalidArgumentException("[divengine.runner] Double '{$name}': nested flow not found: {$path}");
+                }
+                $normalized[$name] = ["kind" => "flow", "path" => $real];
+                continue;
+            }
+
+            if ($kinds[0] === "sequence") {
+                $unknown = array_diff(array_keys($spec), ["sequence", "description"]);
+                if ($unknown !== [] || !is_array($spec["sequence"]) || $spec["sequence"] === [] || !array_is_list($spec["sequence"])) {
+                    throw new InvalidArgumentException("[divengine.runner] Double '{$name}': 'sequence' must be a non-empty list of outcomes.");
+                }
+                $outcomes = [];
+                foreach ($spec["sequence"] as $i => $outcome) {
+                    $outcomes[] = self::normalizeOutcome($outcome, "{$name}.sequence[{$i}]");
+                }
+                $normalized[$name] = ["kind" => "outcomes", "sequence" => true, "outcomes" => $outcomes];
+                continue;
+            }
+
+            $outcome = $spec;
+            unset($outcome["description"]);
+            $normalized[$name] = ["kind" => "outcomes", "sequence" => false, "outcomes" => [self::normalizeOutcome($outcome, $name)]];
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private static function normalizeOutcome(mixed $outcome, string $label): array
+    {
+        if (!is_array($outcome) || ($outcome !== [] && array_is_list($outcome))) {
+            throw new InvalidArgumentException("[divengine.runner] Double outcome {$label} must be a mapping.");
+        }
+        $unknown = array_diff(array_keys($outcome), ["returns", "throws", "pause", "context"]);
+        $kinds = array_values(array_intersect(["returns", "throws", "pause"], array_keys($outcome)));
+        if ($unknown !== [] || count($kinds) !== 1) {
+            throw new InvalidArgumentException(
+                "[divengine.runner] Double outcome {$label} needs exactly one of returns, throws, pause, and optionally context."
+            );
+        }
+        if ($kinds[0] === "throws" && (!is_string($outcome["throws"]) || trim($outcome["throws"]) === "")) {
+            throw new InvalidArgumentException("[divengine.runner] Double outcome {$label}: 'throws' takes an error message.");
+        }
+        if ($kinds[0] === "pause" && $outcome["pause"] !== true) {
+            throw new InvalidArgumentException("[divengine.runner] Double outcome {$label}: 'pause' must be true.");
+        }
+        if (array_key_exists("context", $outcome)) {
+            $context = $outcome["context"];
+            if ($kinds[0] === "throws" || !is_array($context) || ($context !== [] && array_is_list($context))) {
+                throw new InvalidArgumentException(
+                    "[divengine.runner] Double outcome {$label}: 'context' is a mapping, used with returns or pause."
+                );
+            }
+            foreach (array_keys($context) as $key) {
+                if (!is_string($key) || str_starts_with($key, "_")) {
+                    throw new InvalidArgumentException(
+                        "[divengine.runner] Double outcome {$label}: context key '{$key}' is reserved or invalid."
+                    );
+                }
+            }
+        }
+
+        return $outcome;
+    }
+
+    /**
+     * @param array<string, array<string, mixed>> $doubles
+     *
+     * @return array<string, mixed>
+     */
+    private static function doublesForFingerprint(array $doubles): array
+    {
+        // A nested flow takes part through its own source hash, not its path.
+        return array_map(
+            fn (array $double): array => $double["kind"] === "flow" ? ["kind" => "flow"] : $double,
+            $doubles
+        );
+    }
+
+    /**
+     * Resolves a function reference to its declared double. Never imports.
+     *
+     * @param array<string, mixed> $context
+     */
+    private static function resolveDouble(string $name, ?string $module, array $context): callable
+    {
+        $qualified = self::qualifiedName(trim($name), $module);
+        $double = self::$trace["simulation"]["doubles"][$qualified] ?? null;
+        if ($double === null) {
+            self::traceEvent("function.missing", [
+                "block" => self::currentBlock($context),
+                "function" => $qualified,
+            ], $context);
+            throw new RuntimeException(
+                "[divengine.runner] Simulation has no double for function '{$qualified}'; functions are never imported in simulation."
+            );
+        }
+
+        if ($double["kind"] === "flow") {
+            $compiled = self::$trace["simulation"]["compiled"][$qualified] ?? null;
+            if ($compiled === null) {
+                $functionMap = self::$trace["simulation"]["function_map"];
+                $compiled = self::flowFromYaml($double["path"], ["function_map" => $functionMap]);
+                self::$trace["simulation"]["compiled"][$qualified] = $compiled;
+            }
+            self::$trace["last_function"] = ["name" => $qualified, "callable" => $compiled, "kind" => "flow"];
+            return $compiled;
+        }
+
+        $callable = static function (array &$context) use ($qualified): mixed {
+            return self::invokeDouble($qualified, $context);
+        };
+        self::$trace["last_function"] = ["name" => $qualified, "callable" => $callable, "kind" => "double"];
+
+        return $callable;
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private static function invokeDouble(string $qualified, array &$context): mixed
+    {
+        $double = self::$trace["simulation"]["doubles"][$qualified];
+        $call = self::$trace["simulation"]["calls"][$qualified] ?? 0;
+        self::$trace["simulation"]["calls"][$qualified] = $call + 1;
+        $outcome = $double["sequence"] ? ($double["outcomes"][$call] ?? null) : $double["outcomes"][0];
+        $ref = [
+            "call_depth" => self::$trace["function_call_depth"] ?? count(self::flowStack($context)),
+            "block" => self::currentBlock($context),
+            "step" => is_string($context["_current_step_id"] ?? null) ? $context["_current_step_id"] : null,
+            "index" => is_int($context["_current_step_index"] ?? null) ? $context["_current_step_index"] : null,
+            "function" => $qualified,
+            "call" => $call + 1,
+        ];
+
+        if ($outcome === null) {
+            self::traceEvent("double", $ref + ["outcome" => "exhausted"], $context);
+            throw new RuntimeException(
+                "[divengine.runner] Double '{$qualified}' has no outcome for call " . ($call + 1)
+                . " (its sequence has " . count($double["outcomes"]) . ")."
+            );
+        }
+
+        $kind = array_key_exists("returns", $outcome) ? "returns" : (isset($outcome["throws"]) ? "throws" : "pause");
+        self::traceEvent("double", $ref + ["outcome" => $kind], $context);
+
+        if ($kind === "pause" && self::$trace["phase"] === "condition") {
+            throw new RuntimeException("[divengine.runner] Double '{$qualified}' pauses, but only activities can pause.");
+        }
+        if (isset($outcome["context"])) {
+            $context = array_replace($context, $outcome["context"]);
+        }
+        if ($kind === "throws") {
+            throw new RuntimeException($outcome["throws"]);
+        }
+        if ($kind === "pause") {
+            $tokens = self::ensureTokens($context);
+            throw new RuntimeException("{$tokens["pause"]} Pause requested by double {$qualified}");
+        }
+
+        return $outcome["returns"];
+    }
+
+    private static function simulationGuardCondition(string $function): void
+    {
+        $last = self::$trace["last_function"] ?? null;
+        if (self::$trace !== null && self::$trace["simulation"] !== null && is_array($last)
+            && $last["kind"] === "flow" && $last["name"] === $function) {
+            throw new RuntimeException("[divengine.runner] Double '{$function}' is a nested flow; use it as an activity only.");
+        }
+    }
+
+    /**
+     * Counts a step or a transfer against the simulation budget.
+     *
+     * @param array<string, mixed> $context
+     */
+    private static function simulationTick(string $counter, array $context): void
+    {
+        if (self::$trace === null || self::$trace["simulation"] === null) {
+            return;
+        }
+        $used = ++self::$trace["simulation"]["counters"][$counter];
+        $budget = self::$trace["simulation"]["budget"];
+
+        if ($used > $budget[$counter]) {
+            self::exhaustBudget($counter, $budget[$counter], $used, $context);
+        }
+        $elapsed = (hrtime(true) - self::$trace["simulation"]["started"]) / 1e9;
+        if ($elapsed > $budget["seconds"]) {
+            self::exhaustBudget("seconds", $budget["seconds"], round($elapsed, 3), $context);
+        }
+        $cancel = self::$trace["simulation"]["cancel"];
+        if ($cancel !== null && $cancel() === true) {
+            self::exhaustBudget("cancel", null, null, $context);
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private static function exhaustBudget(string $budget, int|float|null $limit, int|float|null $used, array $context): never
+    {
+        self::traceEvent("budget.exhausted", ["budget" => $budget, "limit" => $limit, "used" => $used], $context, true);
+        throw new RuntimeException(
+            $budget === "cancel"
+                ? "[divengine.runner] Simulation cancelled."
+                : "[divengine.runner] Simulation budget exhausted: {$budget} (limit {$limit})."
+        );
     }
 }
