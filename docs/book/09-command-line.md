@@ -27,6 +27,7 @@ php vendor/divengine/runner/bin/run.php flows/order.yml --context state.json --s
 | `--save-context <file>` | Write the resulting context as JSON, replacing the file atomically. |
 | `--json` | Print the resulting context as JSON instead of the state. |
 | `--trace <file>` | Also write a semantic trace of the run (Tracing and Simulation chapter). |
+| `--trace-messages` | Keep error and log messages in the trace; left out by default. |
 | `--simulate <file>` | Simulate a YAML flow with test doubles; no function file is loaded. |
 | `--session <file>` | Simulation state across processes; never a normal-run context. |
 | `-h`, `--help` | Usage. |

@@ -32,8 +32,11 @@ Runner executes code. Treat everything it runs as trusted application code.
   called. The flow and any nested flow named in the doubles are still compiled
   by Runner and run in the same PHP process. Treat flows and doubles files as
   trusted inputs; there is no OS isolation.
-- **Traces redact by key, not by content.** Values under secret-looking keys are
-  redacted by default, but error and log messages are kept as written (see
+- **Traces redact values by key and leave messages out.** Values under
+  secret-looking keys are redacted by default. Error and log messages are free
+  text, so traces replace them with a redaction marker unless
+  `capture_messages` (`--trace-messages`) is set. Context and session files
+  still hold `_runner_error` and `_runner_result` as written (see
   [tracing-and-simulation.md](tracing-and-simulation.md)).
 - **The context is shared and mutable.** Any activity can read and change any key,
   including reserved ones (`_flow_state`, `_root_folder`, helpers).

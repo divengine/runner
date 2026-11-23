@@ -51,6 +51,8 @@ php vendor/divengine/runner/bin/run.php flows/order.yml --context state.json --s
 `--trace` adds a file and changes nothing else. stdout, exit codes and the saved
 context stay the same. A traced real run on the command line uses the default
 trace options. A simulation reads its trace options from the `--simulate` file.
+`--trace-messages` (with `--trace`) sets `capture_messages` for either: error
+and log messages are left out of traces otherwise (see [Secrets](#values-caps-and-redaction)).
 
 ## Simulating with test doubles
 
@@ -94,7 +96,7 @@ double:
 
 Keys are qualified function names as the step references them: `module:name`
 for a step with `module`, otherwise the plain name. A `function_map` option is
-applied first, as at compile time.
+applied first, as at compile time, and takes part in the fingerprint.
 
 | Double | Meaning |
 |---|---|
@@ -210,7 +212,8 @@ Protocol `divengine.runner.trace`, version `1`. The JSON Schema is
         {"role": "doubles", "name": "doubles", "path": null, "sha256": "…"}
     ],
     "limits": {"max_events": 10000, "max_bytes": 4194304, "max_string": 1024, "max_items": 100,
-               "max_depth": 8, "max_nodes": 2000, "capture_values": true, "redact_defaults": true},
+               "max_depth": 8, "max_nodes": 2000, "capture_values": true, "capture_messages": false,
+               "redact_defaults": true},
     "budget": {"steps": 200, "transfers": 50, "seconds": 5.0},
     "result": {"state": "paused", "error": null, "setup_error": false},
     "simulation": {"double_calls": {"orders:validate_order": 1, "billing:compute_total": 1, "needs_approval": 1}},
@@ -225,10 +228,14 @@ Protocol `divengine.runner.trace`, version `1`. The JSON Schema is
 
 - **`sources`** lists every source file with its SHA-256: the flow, the function
   files a traced run loaded (role `function`), and in a simulation the doubles
-  and nested flows.
+  and nested flows. A non-empty `function_map` option is a source too (role
+  `function_map`, `path` null): it decides which function each reference
+  resolves to.
 - **`fingerprint`** covers the sources known before the run starts: the flow,
-  and in a simulation the doubles and nested flows. It covers file content and
-  roles, not paths, so it stays the same when the project moves.
+  the `function_map`, and in a simulation the doubles and nested flows. It
+  covers content and roles, not paths, so it stays the same when the project
+  moves. The map counts after normalization (trimmed names); an empty map
+  counts as no map.
   - `simulate()` takes an expected `fingerprint` and refuses to resume when it
     differs.
   - For traced real runs, function files are discovered while running. Compare
@@ -287,7 +294,7 @@ pass step ids, but it still runs unchanged.
 | `function.missing` | `function` | No double for a reference. Simulation only. |
 | `budget.exhausted` | `budget`, `limit`, `used` | A simulation budget stopped the run (always recorded). |
 | `log` | `level`, `message`, `block`, `step` | A message the flow's functions logged through `_logger`; Runner's own log lines are not repeated. |
-| `trace.truncated` | `reason`, `dropped_events` | The trace hit a cap (always recorded, last). |
+| `trace.truncated` | `reason`, `dropped_events`, `compacted_events` | The trace hit a cap (always recorded, last). |
 
 **Reconstructing the execution:**
 
@@ -315,12 +322,13 @@ Trace values are JSON-safe copies, bounded by `limits` (trace option names):
 | Option | Default | Effect |
 |---|---|---|
 | `max_events` | 10000 | Events kept; later ones are dropped and counted. |
-| `max_bytes` | 4 MiB | Encoded size of the kept events. |
+| `max_bytes` | 4 MiB | Encoded size of the kept events (at least 8192, see below). |
 | `max_string` | 1024 | Bytes of a string (cut on a UTF-8 boundary). |
 | `max_items` | 100 | Items of an array. |
 | `max_depth` | 8 | Nesting levels of an array; also stops recursive arrays. |
 | `max_nodes` | 2000 | Values copied per event, overall. |
 | `capture_values` | true | `false` keeps only value types. |
+| `capture_messages` | false | `true` keeps error and log messages (capped by `max_string`). |
 | `redact_keys` | `[]` | Extra key names to redact (case-insensitive). |
 | `redact_defaults` | true | Redact keys that look secret (below). |
 | `exclude_keys` | `[]` | Keys left out of snapshots, changes and values. |
@@ -341,13 +349,35 @@ become marker objects:
 | `{"$type": "more", "count": n}` | Last item of a list cut by `max_items`. |
 | `"$more": n` | Key added to a map cut by `max_items`. |
 | `{"$type": "truncated"}` | A value cut by `max_nodes`. |
+| `{"$type": "truncated", "reason": "max_bytes"}` | An event field cut because the event did not fit in `max_bytes` (see below). In `changes`, the only item, with `count`. |
+| `{"$type": "redacted"}` as `message` | An error or log message left out (`capture_messages` is false). |
+
+Copies share one `max_nodes` allowance per value, and per snapshot or `changes`
+list: keys past it, and keys longer than `max_string`, are not copied but
+counted, in `"$more"` for a map (a context snapshot is a map) and in a final
+`{"$type": "more", "count": n}` item for `changes`.
 
 User data that itself holds a `$type` key reads like a marker.
 
-**Truncation is explicit.** `truncated` and `truncation` describe it in the
-document. `run.end`, `budget.exhausted` and `trace.truncated` are always kept,
-so a trace may exceed `max_events` by those three events. Tracing never stops or
-changes the run.
+**Size is strictly bounded.** The kept events, each counted as one compact
+JSON line (`json_encode` with unescaped slashes and Unicode), never exceed
+`max_bytes`:
+
+1. Ordinary events use at most three quarters of `max_bytes`. An event that
+   does not fit in what is left has its bulky fields (`context`, `changes`,
+   `result`, `value`) replaced by `max_bytes` markers; if it still does not
+   fit, it is dropped and so is every later ordinary event.
+2. The forced events `budget.exhausted`, `run.end` and `trace.truncated` (once
+   each) use the last quarter. When one does not fit, its bulky fields become
+   markers, then its `checkpoint` and error message, and its error class is cut
+   to 200 bytes. This compact form always fits, which is why `max_bytes` is at
+   least 8192: `run.end` is always present.
+3. Forced events may exceed `max_events` by up to three.
+
+**Truncation is explicit.** `truncated` is true when events were dropped or
+compacted. `truncation` gives the `reason` (`max_events` or `max_bytes`),
+`dropped_events` and `compacted_events`, and the `trace.truncated` event repeats
+it as the last event. Tracing never stops or changes the run.
 
 **Secrets.** By default, values under keys matching `password`, `passwd`,
 `passphrase`, `secret`, `token`, `api_key`, `access_key`, `private_key`,
@@ -357,13 +387,20 @@ capitals match too, as do keys that contain these words. This covers context
 snapshots, changes, step `context` mappings and activity results (under the
 step id).
 
-What redaction does not cover:
+Beyond key names:
 
-- **Messages.** Error messages (`error.message`) and `log` messages are kept as
-  written, capped by `max_string`. Do not put secrets in exception or log
-  messages.
-- **`_runner_logs` and `_runner_error`.** These context keys are written by
-  Runner, not by the trace, and are not redacted.
+- **Messages are left out by default.** Error messages (`error.message`) and
+  `log` messages are free text that can hold any value, so key-based redaction
+  cannot protect them. Unless `capture_messages` is true (`--trace-messages` on
+  the command line), each one is `{"$type": "redacted"}`; the error class, the
+  log level and the step stay. With `capture_messages`, messages are kept as
+  written, capped by `max_string`. The logger, `_runner_logs`, `_runner_error`,
+  `_runner_result` and stderr get full messages as before: this only concerns
+  the trace.
+- **`_runner_logs`, `_runner_error` and `_runner_result`.** These context keys
+  are written by Runner, not by the trace, and are not redacted. Traces leave
+  them out (snapshots and changes skip `_` keys), but `--save-context` and
+  `--session` files hold the whole context, messages included.
 
 Redact or exclude more keys with `redact_keys` and `exclude_keys`, or set
 `capture_values: false`.

@@ -229,6 +229,7 @@ php vendor/divengine/runner/bin/run.php flows/order.yml --context state.json --s
 | `--save-context <file>` | Write the resulting context as JSON. The file is replaced atomically (temporary file in the same folder, then rename). |
 | `--json` | Print the resulting context as JSON instead of the state. |
 | `--trace <file>` | Also write a semantic trace of the run (see [Tracing and simulation](#tracing-and-simulation)). |
+| `--trace-messages` | Keep error and log messages in the trace; they are left out by default. |
 | `--simulate <file>` | Simulate a YAML flow with the test doubles of this JSON file instead of running its functions. |
 | `--session <file>` | Simulation state across processes: resumed when the file exists, then rewritten. |
 | `-h`, `--help` | Usage. |
@@ -390,7 +391,9 @@ The other public static methods (`flowLoop`, `checkPause`, `updateContext`,
 versioned JSON trace: block entries, started and skipped steps, condition
 outcomes, activity results and context changes, `call`, `jump` and return
 transfers, pauses with their checkpoint, and nested flow scopes. Values in the
-trace are bounded, JSON-safe and redacted by key (`password`, `token`, …).
+trace are bounded, JSON-safe and redacted by key (`password`, `token`, …);
+error and log messages are left out unless requested, and the trace never
+exceeds `max_bytes`.
 
 `runner::simulate()` runs a YAML flow through the same runtime, but every
 condition and activity answers from a declared test double: fixed values,

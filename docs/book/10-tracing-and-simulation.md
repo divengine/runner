@@ -39,7 +39,12 @@ php vendor/divengine/runner/bin/run.php flows/invoice.yml --simulate doubles.jso
 - **Determinism.** The same flow, context and doubles produce the same events.
   Only `meta` and source paths vary.
 - **Bounded traces.** Caps for events, bytes, strings, items, depth and copied
-  values are explicit; truncation is reported, never silent.
+  values are explicit; truncation is reported, never silent. The kept events
+  never exceed `max_bytes`, and `run.end` is always kept, compacted if needed.
+- **Messages stay out.** Error and log messages can hold anything, so a trace
+  keeps them only with `capture_messages` (`--trace-messages`).
+- **Resumes check their sources.** The fingerprint covers the flow, the
+  doubles, nested flows and `function_map`; a changed one refuses to resume.
 - **Bounded simulations.** Budgets for steps, transfers and wall-clock time
   stop endless loops with a `budget.exhausted` event.
 

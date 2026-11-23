@@ -25,7 +25,7 @@
         "type": "object",
         "required": ["role", "name", "path", "sha256"],
         "properties": {
-          "role": { "enum": ["flow", "function", "doubles", "nested_flow"] },
+          "role": { "enum": ["flow", "function", "doubles", "nested_flow", "function_map"] },
           "name": { "type": "string" },
           "path": { "type": ["string", "null"] },
           "sha256": { "type": ["string", "null"] }
@@ -77,15 +77,20 @@
         { "type": "null" },
         {
           "type": "object",
-          "required": ["reason", "dropped_events"],
+          "required": ["reason", "dropped_events", "compacted_events"],
           "properties": {
             "reason": { "enum": ["max_events", "max_bytes"] },
-            "dropped_events": { "type": "integer" }
+            "dropped_events": { "type": "integer", "minimum": 0 },
+            "compacted_events": { "type": "integer", "minimum": 0 }
           }
         }
       ]
     },
-    "events": { "type": "array", "items": { "$ref": "#/$defs/event" } },
+    "events": {
+      "description": "Each event encoded as one compact JSON line; the lines never exceed limits.max_bytes in total.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/event" }
+    },
     "meta": {
       "description": "Nondeterministic metadata: excluded from comparisons.",
       "type": "object"
@@ -100,10 +105,22 @@
           "required": ["class", "message"],
           "properties": {
             "class": { "type": "string" },
-            "message": { "type": "string" }
+            "message": { "$ref": "#/$defs/message" }
           }
         }
       ]
+    },
+    "message": {
+      "description": "Error or log message: a redaction marker unless limits.capture_messages is true, or a max_bytes marker in a compacted forced event.",
+      "oneOf": [
+        { "type": "string" },
+        { "$ref": "#/$defs/marker" }
+      ]
+    },
+    "marker": {
+      "type": "object",
+      "required": ["$type"],
+      "properties": { "$type": { "type": "string" } }
     },
     "position": {
       "type": "object",
@@ -153,7 +170,15 @@
         "reason": { "type": "string" },
         "target": { "$ref": "#/$defs/position" },
         "returns": { "type": "boolean" },
-        "changes": { "type": "array", "items": { "$ref": "#/$defs/change" } },
+        "changes": {
+          "type": "array",
+          "items": { "oneOf": [{ "$ref": "#/$defs/change" }, { "$ref": "#/$defs/marker" }] }
+        },
+        "message": { "$ref": "#/$defs/message" },
+        "context": {
+          "description": "Business-key snapshot (run.start, run.end; an empty one encodes as []), or a max_bytes marker in a compacted event.",
+          "type": ["object", "array"]
+        },
         "error": { "$ref": "#/$defs/error" }
       }
     }
