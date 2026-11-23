@@ -1,0 +1,14 @@
+id: modules
+blocks:
+  main:
+    steps:
+      invoice:
+        module: billing
+        activity: total
+      shipping:
+        module: shipping
+        activity: total
+      plain:
+        activity: side_effect
+      named:
+        activity: divengine\runner\Tests\sideEffectCallable

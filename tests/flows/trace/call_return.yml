@@ -1,0 +1,17 @@
+id: call_return
+blocks:
+  main:
+    steps:
+      before:
+        activity: produce
+      delegate:
+        call: sub.work
+        activity: consume
+      after:
+        activity: produce
+  sub:
+    steps:
+      skipped_by_target:
+        activity: never_runs
+      work:
+        activity: produce

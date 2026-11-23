@@ -1,0 +1,8 @@
+id: ordinary
+blocks:
+  main:
+    steps:
+      first:
+        activity: produce
+      second:
+        activity: consume

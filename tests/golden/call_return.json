@@ -1,0 +1,319 @@
+{
+    "protocol": "divengine.runner.trace",
+    "version": 1,
+    "mode": "simulation",
+    "flow_id": "call_return",
+    "result": {
+        "state": "done",
+        "error": null,
+        "setup_error": false
+    },
+    "truncated": false,
+    "events": [
+        {
+            "seq": 1,
+            "type": "run.start",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "mode": "simulation",
+            "resume": false,
+            "checkpoint": {
+                "flow_state": [],
+                "flow_stack": []
+            },
+            "context": []
+        },
+        {
+            "seq": 2,
+            "type": "block.enter",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "reason": "start"
+        },
+        {
+            "seq": 3,
+            "type": "step.start",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "before",
+            "index": 1,
+            "continuation": false
+        },
+        {
+            "seq": 4,
+            "type": "activity.start",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "before",
+            "index": 1,
+            "function": "produce"
+        },
+        {
+            "seq": 5,
+            "type": "double",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "before",
+            "index": 1,
+            "function": "produce",
+            "call": 1,
+            "outcome": "returns"
+        },
+        {
+            "seq": 6,
+            "type": "activity.end",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "before",
+            "index": 1,
+            "function": "produce",
+            "result": "produced",
+            "changes": [
+                {
+                    "key": "before",
+                    "op": "added",
+                    "after": "produced"
+                }
+            ]
+        },
+        {
+            "seq": 7,
+            "type": "step.start",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "delegate",
+            "index": 2,
+            "continuation": false
+        },
+        {
+            "seq": 8,
+            "type": "call",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "delegate",
+            "index": 2,
+            "target": {
+                "block": "sub",
+                "index": 2
+            },
+            "returns": true
+        },
+        {
+            "seq": 9,
+            "type": "block.enter",
+            "flow_depth": 0,
+            "call_depth": 1,
+            "block": "sub",
+            "reason": "call"
+        },
+        {
+            "seq": 10,
+            "type": "step.skip",
+            "flow_depth": 0,
+            "call_depth": 1,
+            "block": "sub",
+            "step": "skipped_by_target",
+            "index": 1,
+            "reason": "before_target"
+        },
+        {
+            "seq": 11,
+            "type": "step.start",
+            "flow_depth": 0,
+            "call_depth": 1,
+            "block": "sub",
+            "step": "work",
+            "index": 2,
+            "continuation": false
+        },
+        {
+            "seq": 12,
+            "type": "activity.start",
+            "flow_depth": 0,
+            "call_depth": 1,
+            "block": "sub",
+            "step": "work",
+            "index": 2,
+            "function": "produce"
+        },
+        {
+            "seq": 13,
+            "type": "double",
+            "flow_depth": 0,
+            "call_depth": 1,
+            "block": "sub",
+            "step": "work",
+            "index": 2,
+            "function": "produce",
+            "call": 2,
+            "outcome": "returns"
+        },
+        {
+            "seq": 14,
+            "type": "activity.end",
+            "flow_depth": 0,
+            "call_depth": 1,
+            "block": "sub",
+            "step": "work",
+            "index": 2,
+            "function": "produce",
+            "result": "produced",
+            "changes": [
+                {
+                    "key": "work",
+                    "op": "added",
+                    "after": "produced"
+                }
+            ]
+        },
+        {
+            "seq": 15,
+            "type": "block.exit",
+            "flow_depth": 0,
+            "call_depth": 1,
+            "block": "sub"
+        },
+        {
+            "seq": 16,
+            "type": "call.return",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "from": "sub",
+            "to": {
+                "block": "main",
+                "step": "delegate",
+                "index": 2
+            },
+            "resumed": false
+        },
+        {
+            "seq": 17,
+            "type": "activity.start",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "delegate",
+            "index": 2,
+            "function": "consume"
+        },
+        {
+            "seq": 18,
+            "type": "double",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "delegate",
+            "index": 2,
+            "function": "consume",
+            "call": 1,
+            "outcome": "returns"
+        },
+        {
+            "seq": 19,
+            "type": "activity.end",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "delegate",
+            "index": 2,
+            "function": "consume",
+            "result": 1.0,
+            "changes": [
+                {
+                    "key": "consumed",
+                    "op": "added",
+                    "after": true
+                },
+                {
+                    "key": "delegate",
+                    "op": "added",
+                    "after": 1.0
+                }
+            ]
+        },
+        {
+            "seq": 20,
+            "type": "step.start",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "after",
+            "index": 3,
+            "continuation": false
+        },
+        {
+            "seq": 21,
+            "type": "activity.start",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "after",
+            "index": 3,
+            "function": "produce"
+        },
+        {
+            "seq": 22,
+            "type": "double",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "after",
+            "index": 3,
+            "function": "produce",
+            "call": 3,
+            "outcome": "returns"
+        },
+        {
+            "seq": 23,
+            "type": "activity.end",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main",
+            "step": "after",
+            "index": 3,
+            "function": "produce",
+            "result": "produced",
+            "changes": [
+                {
+                    "key": "after",
+                    "op": "added",
+                    "after": "produced"
+                }
+            ]
+        },
+        {
+            "seq": 24,
+            "type": "block.exit",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "block": "main"
+        },
+        {
+            "seq": 25,
+            "type": "run.end",
+            "flow_depth": 0,
+            "call_depth": 0,
+            "state": "done",
+            "error": null,
+            "setup_error": false,
+            "checkpoint": {
+                "flow_state": [],
+                "flow_stack": []
+            },
+            "context": {
+                "before": "produced",
+                "work": "produced",
+                "consumed": true,
+                "delegate": 1.0,
+                "after": "produced"
+            }
+        }
+    ]
+}

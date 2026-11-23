@@ -12,5 +12,7 @@ docs/context-keys.md
 docs/sfm-compatibility.md
 docs/security.md
 docs/book/09-command-line.md
+docs/book/10-tracing-and-simulation.md
+docs/tracing-and-simulation.md
 docs/book/07-quality-and-ci.md
 docs/book/08-appendix-examples.md

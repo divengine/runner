@@ -1,0 +1,7 @@
+id: loop
+blocks:
+  main:
+    steps:
+      spin:
+        activity: produce
+        jump: main.spin
