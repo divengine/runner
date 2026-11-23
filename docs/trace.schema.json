@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/divengine/runner/blob/main/docs/trace.schema.json",
+  "title": "divengine.runner.trace, version 1",
+  "description": "Trace document returned by runner::runTraced() and runner::simulate() and written by bin/run.php --trace. See docs/tracing-and-simulation.md. Consumers must ignore unknown properties and unknown event types.",
+  "type": "object",
+  "required": ["protocol", "version", "mode", "flow", "fingerprint", "sources", "limits", "budget", "result", "simulation", "truncated", "truncation", "events", "meta"],
+  "properties": {
+    "protocol": { "const": "divengine.runner.trace" },
+    "version": { "const": 1 },
+    "mode": { "enum": ["run", "simulation"] },
+    "flow": {
+      "type": "object",
+      "required": ["path", "id", "callable"],
+      "properties": {
+        "path": { "type": ["string", "null"] },
+        "id": { "type": ["string", "null"] },
+        "callable": { "type": ["string", "null"] }
+      }
+    },
+    "fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["role", "name", "path", "sha256"],
+        "properties": {
+          "role": { "enum": ["flow", "function", "doubles", "nested_flow"] },
+          "name": { "type": "string" },
+          "path": { "type": ["string", "null"] },
+          "sha256": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "limits": { "type": "object" },
+    "budget": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["steps", "transfers", "seconds"],
+          "properties": {
+            "steps": { "type": "integer" },
+            "transfers": { "type": "integer" },
+            "seconds": { "type": "number" }
+          }
+        }
+      ]
+    },
+    "result": {
+      "type": ["object", "null"],
+      "required": ["state", "error", "setup_error"],
+      "properties": {
+        "state": { "enum": ["done", "paused", "error"] },
+        "error": { "$ref": "#/$defs/error" },
+        "setup_error": { "type": "boolean" }
+      }
+    },
+    "simulation": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["double_calls"],
+          "properties": {
+            "double_calls": {
+              "type": ["object", "array"],
+              "additionalProperties": { "type": "integer" }
+            }
+          }
+        }
+      ]
+    },
+    "truncated": { "type": "boolean" },
+    "truncation": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["reason", "dropped_events"],
+          "properties": {
+            "reason": { "enum": ["max_events", "max_bytes"] },
+            "dropped_events": { "type": "integer" }
+          }
+        }
+      ]
+    },
+    "events": { "type": "array", "items": { "$ref": "#/$defs/event" } },
+    "meta": {
+      "description": "Nondeterministic metadata: excluded from comparisons.",
+      "type": "object"
+    }
+  },
+  "$defs": {
+    "error": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["class", "message"],
+          "properties": {
+            "class": { "type": "string" },
+            "message": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "position": {
+      "type": "object",
+      "required": ["block", "index"],
+      "properties": {
+        "block": { "type": "string" },
+        "step": { "type": "string" },
+        "index": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "change": {
+      "type": "object",
+      "required": ["key", "op"],
+      "properties": {
+        "key": { "type": ["string", "integer"] },
+        "op": { "enum": ["added", "changed", "removed"] },
+        "before": {},
+        "after": {}
+      }
+    },
+    "event": {
+      "type": "object",
+      "required": ["seq", "type", "flow_depth", "call_depth"],
+      "properties": {
+        "seq": { "type": "integer", "minimum": 1 },
+        "type": {
+          "enum": [
+            "run.start", "run.autoresume", "run.end",
+            "flow.enter", "flow.exit",
+            "block.enter", "block.exit",
+            "step.start", "step.skip",
+            "condition", "condition.error",
+            "context.update",
+            "activity.start", "activity.end", "activity.error", "activity.pause",
+            "call", "call.return", "call.drop",
+            "jump", "pause",
+            "double", "function.missing",
+            "budget.exhausted", "log", "trace.truncated"
+          ]
+        },
+        "flow_depth": { "type": "integer", "minimum": 0 },
+        "call_depth": { "type": "integer", "minimum": 0 },
+        "block": { "type": ["string", "null"] },
+        "step": { "type": ["string", "null"] },
+        "index": { "type": "integer", "minimum": 1 },
+        "function": { "type": "string" },
+        "reason": { "type": "string" },
+        "target": { "$ref": "#/$defs/position" },
+        "returns": { "type": "boolean" },
+        "changes": { "type": "array", "items": { "$ref": "#/$defs/change" } },
+        "error": { "$ref": "#/$defs/error" }
+      }
+    }
+  }
+}

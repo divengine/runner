@@ -22,6 +22,8 @@ python scripts/build_pdf.py --output runner-documentation.pdf
 ## Further reading
 
 - `docs/sfm-compatibility.md`: compatibility matrix with the SFM runtime
+- `docs/tracing-and-simulation.md`: trace protocol, test doubles and simulation sessions
+- `docs/trace.schema.json`: JSON Schema of the trace document
 - `docs/security.md`: trust boundary (`eval()`, imports)
 - `docs/context-keys.md`: reserved context keys
 

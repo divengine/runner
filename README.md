@@ -228,6 +228,9 @@ php vendor/divengine/runner/bin/run.php flows/order.yml --context state.json --s
 | `--root <dir>` | Folder of activity and condition files; sets `_root_folder`. |
 | `--save-context <file>` | Write the resulting context as JSON. The file is replaced atomically (temporary file in the same folder, then rename). |
 | `--json` | Print the resulting context as JSON instead of the state. |
+| `--trace <file>` | Also write a semantic trace of the run (see [Tracing and simulation](#tracing-and-simulation)). |
+| `--simulate <file>` | Simulate a YAML flow with the test doubles of this JSON file instead of running its functions. |
+| `--session <file>` | Simulation state across processes: resumed when the file exists, then rewritten. |
 | `-h`, `--help` | Usage. |
 
 Relative paths are relative to the current working directory, so run it from
@@ -372,12 +375,37 @@ not re-apply your initial context for you; jump loops are not limited (recursive
 | `runner::flowFromYaml($path, $options)` | Compile a YAML flow to a closure. |
 | `runner::generateFlowCodeFromYaml($path, $options)` | Compile a YAML flow to PHP source. |
 | `runner::importer($name, $module, $context, $logger)` | Resolve a function as described above. |
+| `runner::runTraced($flow, &$context, $options)` | Run like `run()` and return a semantic trace of the run (option `trace`: caps and redaction). |
+| `runner::simulate($yamlPath, &$context, $doubles, $options)` | Simulate a YAML flow with test doubles; no function is loaded. Returns the trace. |
 | `runner::setLogger($logger)` | Global log sink. |
 | `runner::safeSerialize($data)`, `runner::dumpException($e)` | Diagnostic helpers. |
 
 The other public static methods (`flowLoop`, `checkPause`, `updateContext`,
 `resumeAfterCall`, `wrapCondition`, `wrapActivity`, `wrapCall`, `wrapJump`,
 `wrapPause`) are called by generated flow code and are marked `@internal`.
+
+## Tracing and simulation
+
+`runner::runTraced()` runs a flow exactly like `run()` and also returns a
+versioned JSON trace: block entries, started and skipped steps, condition
+outcomes, activity results and context changes, `call`, `jump` and return
+transfers, pauses with their checkpoint, and nested flow scopes. Values in the
+trace are bounded, JSON-safe and redacted by key (`password`, `token`, …).
+
+`runner::simulate()` runs a YAML flow through the same runtime, but every
+condition and activity answers from a declared test double: fixed values,
+sequences, errors or pauses. No function file is loaded and no callable name is
+called; a reference without a double fails clearly. Budgets for steps,
+transfers and time stop endless loops.
+
+```bash
+php vendor/divengine/runner/bin/run.php flows/invoice.yml --simulate doubles.json \
+    --context context.json --session session.json --trace trace.json
+```
+
+See [docs/tracing-and-simulation.md](docs/tracing-and-simulation.md) for the
+trace protocol, the doubles format, sessions, exit codes and the security
+model, and [`examples/simulation`](examples/simulation) for a complete example.
 
 ## Logging
 
@@ -394,6 +422,7 @@ Logs of each run are also stored in `$context["_runner_logs"]`.
 
 - [docs/README.md](docs/README.md): overview and YAML API
 - [docs/sfm-compatibility.md](docs/sfm-compatibility.md): SFM compatibility matrix
+- [docs/tracing-and-simulation.md](docs/tracing-and-simulation.md): trace protocol and simulation
 - [docs/security.md](docs/security.md): trust boundary
 - [docs/context-keys.md](docs/context-keys.md): reserved context keys
 - [docs/book/](docs/book): book chapters (`composer docs:pdf` builds a PDF)

@@ -49,6 +49,11 @@ Context keys follow the same vocabulary: `_current_block_id`, `_flow_state.block
 | Errors do not leave resumable state | Any error, including setup errors and errors before a saved position is reached, clears `_flow_state`, `_flow_stack` and pending resume markers; business data and diagnostics stay, and the next run starts at the first block. | `testErrorInsideCalledBlockLeavesNoStaleCallFrames`, `testErrorBeforeSavedPositionIsConsumedRestartsAtFirstBlock`, `testSetupErrorOnResumeClearsSavedPosition`, `testErrorAfterCallReturnRestartsAtFirstBlock`, `testRepeatedPauseJumpAndErrorAcrossCallsResumeFromJson` |
 | Storable context | After `run()` returns, the runner's helpers and block callables are removed; JSON serialization of user-supplied values is not guaranteed. | `testContextAfterRunHoldsOnlyData`, `testDeepCallContinuationsResumeFromJsonInFreshProcesses` |
 
+Tracing (`runner::runTraced()`) and simulation (`runner::simulate()`) use this
+same runtime, so the rows above hold for them. Steps, transfers and pauses are
+recorded as events, and simulation replaces functions with test doubles. See
+[tracing-and-simulation.md](tracing-and-simulation.md).
+
 ## Known divergences
 
 | Behavior | Python reference runtime | Runner | Reason |

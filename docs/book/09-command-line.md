@@ -26,6 +26,9 @@ php vendor/divengine/runner/bin/run.php flows/order.yml --context state.json --s
 | `--root <dir>` | Folder of activity and condition files; stored as an absolute `_root_folder`. |
 | `--save-context <file>` | Write the resulting context as JSON, replacing the file atomically. |
 | `--json` | Print the resulting context as JSON instead of the state. |
+| `--trace <file>` | Also write a semantic trace of the run (Tracing and Simulation chapter). |
+| `--simulate <file>` | Simulate a YAML flow with test doubles; no function file is loaded. |
+| `--session <file>` | Simulation state across processes; never a normal-run context. |
 | `-h`, `--help` | Usage. |
 
 Values can also be written as `--root=functions`. Relative paths are relative to
