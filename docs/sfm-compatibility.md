@@ -7,7 +7,7 @@ and job execution). The Python SFM modeler (canonical YAML, compiler, validator,
 simulator) is the secondary reference for YAML shape and step semantics
 (flow simulation notes, ADR-S03, ADR-I2-S01, ADR-I2-S02).
 
-Status of v0.2.0; the execution semantics are unchanged since v0.1.0. Test names
+Status of v0.3.0; the execution semantics are unchanged since v0.1.0. Test names
 refer to `tests/RunnerTest.php`.
 
 ## Terminology
@@ -95,5 +95,9 @@ ADR-I2-S01). Tests: `testDeepCallContinuationsResumeFromJsonInFreshProcesses`,
 - `_progress` reporting key.
 - YAML files used directly as activities (compile them to PHP first, as in
   `testNestedFlowActivityRestoresParentBlocks`).
-- Iteration limits for jump loops.
-- Modeler features: diagnostics with codes, simulation, legacy import, releases.
+- Iteration limits for jump loops in normal runs (issue #31). Simulations have
+  step, transfer and time budgets (see
+  [tracing-and-simulation.md](tracing-and-simulation.md)).
+- Modeler features: diagnostics with codes, legacy import, releases. Runner's
+  own simulation runs on its runtime with test doubles; it is not the
+  modeler's simulator.
